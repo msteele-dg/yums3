@@ -209,23 +209,189 @@ Required S3 permissions:
 
 ## Client Configuration
 
-To use your S3-backed repository with DNF/YUM:
+### Public S3 Bucket (Recommended for Open Source)
+
+If your S3 bucket allows public read access:
 
 ```bash
-# Create repo configuration
-cat > /etc/yum.repos.d/my-repo.repo <<EOF
+# Create repo configuration (works for all EL versions and architectures)
+sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
 [my-repo]
 name=My Repository
-baseurl=https://your-bucket.s3.amazonaws.com/el9/x86_64
+baseurl=https://your-bucket.s3.amazonaws.com/el\$releasever/\$basearch
 enabled=1
 gpgcheck=0
+repo_gpgcheck=0
 EOF
 
-# Install packages
-dnf install my-package
+# Update cache and install packages
+sudo dnf makecache
+sudo dnf install my-package
 ```
 
-For private buckets, use presigned URLs or configure IAM roles on your instances.
+**YUM Variables Explained:**
+- `$releasever` - Automatically expands to `9` on Rocky/RHEL 9, `8` on Rocky/RHEL 8, etc.
+- `$basearch` - Automatically expands to `x86_64`, `aarch64`, etc.
+- Use `\$` to prevent shell expansion when writing the config file
+
+**Result:** On Rocky Linux 9 x86_64, the baseurl becomes:
+```
+https://your-bucket.s3.amazonaws.com/el9/x86_64
+```
+
+### Private S3 Bucket (IAM Roles)
+
+For private buckets, use IAM roles on EC2 instances:
+
+**1. Create IAM policy:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket/*",
+        "arn:aws:s3:::your-bucket"
+      ]
+    }
+  ]
+}
+```
+
+**2. Attach policy to EC2 instance role**
+
+**3. Install S3 plugin for YUM:**
+```bash
+# Rocky/RHEL 9
+sudo dnf install python3-dnf-plugin-s3
+
+# Rocky/RHEL 8
+sudo dnf install python3-dnf-plugin-s3
+
+# Ubuntu (requires custom setup)
+# S3 plugin not officially supported, use presigned URLs instead
+```
+
+**4. Configure repo:**
+```bash
+sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
+[my-repo]
+name=My Private Repository
+baseurl=s3://your-bucket/el\$releasever/\$basearch
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+s3_enabled=1
+EOF
+```
+
+### Private S3 Bucket (Presigned URLs)
+
+For temporary access without IAM roles:
+
+**1. Generate presigned URL (valid for 7 days):**
+```bash
+aws s3 presign s3://your-bucket/el9/x86_64/repodata/repomd.xml --expires-in 604800
+```
+
+**2. Use CloudFront or API Gateway** for permanent URLs with authentication
+
+**3. Or use a simple proxy script:**
+```bash
+# Install nginx
+sudo dnf install nginx
+
+# Configure nginx to proxy S3 with credentials
+sudo tee /etc/nginx/conf.d/yum-proxy.conf <<EOF
+server {
+    listen 8080;
+    location / {
+        proxy_pass https://your-bucket.s3.amazonaws.com;
+        proxy_set_header Authorization "AWS4-HMAC-SHA256 ...";
+    }
+}
+EOF
+
+# Configure repo to use local proxy
+sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
+[my-repo]
+name=My Repository
+baseurl=http://localhost:8080/el\$releasever/\$basearch
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+EOF
+```
+
+### With GPG Package Signing
+
+If you signed your RPMs:
+
+```bash
+# Import GPG public key
+sudo rpm --import https://your-bucket.s3.amazonaws.com/RPM-GPG-KEY-your-repo
+
+# Configure repo with GPG check enabled
+sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
+[my-repo]
+name=My Repository
+baseurl=https://your-bucket.s3.amazonaws.com/el\$releasever/\$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://your-bucket.s3.amazonaws.com/RPM-GPG-KEY-your-repo
+EOF
+```
+
+### Testing Your Configuration
+
+```bash
+# Clear cache
+sudo dnf clean all
+
+# Verify repo is accessible
+sudo dnf repolist
+
+# List available packages
+sudo dnf list available --repo=my-repo
+
+# Install a package
+sudo dnf install --repo=my-repo my-package
+```
+
+### Troubleshooting Client Issues
+
+**"Cannot retrieve repository metadata"**
+```bash
+# Check what variables expand to on your system
+echo "Release: $(rpm -E %{rhel}), Arch: $(uname -m)"
+
+# Check S3 bucket permissions (adjust el9/x86_64 to match your system)
+aws s3 ls s3://your-bucket/el9/x86_64/repodata/
+
+# Test direct access
+curl -I https://your-bucket.s3.amazonaws.com/el9/x86_64/repodata/repomd.xml
+
+# Check repo configuration and variable expansion
+sudo dnf repolist -v
+```
+
+**"Checksum doesn't match"**
+```bash
+# Clear DNF cache
+sudo dnf clean all
+sudo dnf makecache
+```
+
+**"404 Not Found"**
+- Verify the EL version and architecture match your system
+- Check that packages were uploaded successfully
+- Ensure S3 bucket allows public read (or IAM role is configured)
 
 ## Caveats and Limitations
 
