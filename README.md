@@ -166,16 +166,52 @@ This tool handles this by:
 
 ## Configuration
 
+### Configuration File
+
+Create a configuration file to avoid specifying options every time:
+
+**Location** (searched in order):
+1. `./yums3.conf` (current directory)
+2. `~/.yums3.conf` (user home)
+3. `/etc/yums3.conf` (system-wide)
+
+**Format** (JSON):
+```json
+{
+  "s3_bucket": "your-bucket-name",
+  "local_repo_base": "/custom/cache/path"
+}
+```
+
+**Example:**
+```bash
+# Create user config
+cat > ~/.yums3.conf <<EOF
+{
+  "s3_bucket": "my-company-yum-repo",
+  "local_repo_base": "/tmp/yum-cache"
+}
+EOF
+
+# Now you can run without specifying bucket
+./yums3.py my-package.rpm
+```
+
+### Command-Line Overrides
+
+CLI arguments override config file values:
+
+```bash
+# Use different bucket (overrides config)
+./yums3.py --bucket other-bucket my-package.rpm
+
+# Use different cache directory (overrides config)
+./yums3.py --repo-dir /tmp/custom-cache my-package.rpm
+```
+
 ### S3 Bucket
 
-By default, the tool uses the bucket `deepgram-yum-repo`. To use a different bucket, modify the `YumRepo` initialization in the script:
-
-```python
-repo = YumRepo(
-    s3_bucket_name="your-bucket-name",
-    local_repo_base=args.repo_dir
-)
-```
+If no configuration file exists and no `--bucket` argument is provided, the default bucket `deepgram-yum-repo` is used.
 
 ### AWS Credentials
 

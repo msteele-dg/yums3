@@ -18,6 +18,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+import json
 
 try:
     import boto3
@@ -62,7 +63,7 @@ class Colors:
 class YumRepo:
     """YUM repository manager for S3-backed repositories"""
     
-    def __init__(self, s3_bucket_name="deepgram-yum-repo", local_repo_base=None, skip_validation=False):
+    def __init__(self, s3_bucket_name, local_repo_base=None, skip_validation=False):
         """
         Initialize YUM repository manager
         
@@ -348,7 +349,8 @@ class YumRepo:
         for rpm_file in rpm_files:
             subprocess.run(['cp', rpm_file, repo_dir], check=True)
         
-        subprocess.run(['createrepo_c', repo_dir], check=True, 
+        # Create repo without SQLite databases (XML only)
+        subprocess.run(['createrepo_c', '--no-database', repo_dir], check=True, 
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         print("Uploading to S3...")
@@ -375,7 +377,8 @@ class YumRepo:
             for rpm_file in rpm_files:
                 subprocess.run(['cp', rpm_file, temp_repo], check=True)
             
-            subprocess.run(['createrepo_c', temp_repo], check=True,
+            # Create metadata without SQLite databases
+            subprocess.run(['createrepo_c', '--no-database', temp_repo], check=True,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             print("Merging metadata...")
@@ -623,6 +626,48 @@ class YumRepo:
         xml_content = output.getvalue().decode('utf-8')
         
         # Remove namespace prefixes from repomd.xml only
+        xml_content = re.sub(r'<repo:', '<', xml_content)
+        xml_content = re.sub(r'</repo:', '</', xml_content)
+        xml_content = re.sub(r' xmlns:repo="[^"]*"', '', xml_content)
+        xml_content = re.sub(r' xmlns:rpm="[^"]*"', '', xml_content)
+        
+        with open(repomd_path, 'w', encoding='utf-8') as f:
+            f.write(xml_content)
+        
+        # Remove SQLite database entries and files
+        self._remove_sqlite_databases(repo_dir)
+    
+    def _remove_sqlite_databases(self, repo_dir):
+        """Remove SQLite database entries from repomd.xml and delete .sqlite files"""
+        repodata_dir = os.path.join(repo_dir, 'repodata')
+        repomd_path = os.path.join(repodata_dir, 'repomd.xml')
+        
+        # Parse repomd.xml
+        tree = ET.parse(repomd_path)
+        root = tree.getroot()
+        
+        # Find and remove all *_db entries
+        data_elements = root.findall('data')
+        for data in data_elements:
+            data_type = data.get('type')
+            if data_type and data_type.endswith('_db'):
+                root.remove(data)
+                
+                # Get filename and delete the file
+                location = data.find('location')
+                if location is not None:
+                    filename = location.get('href').replace('repodata/', '')
+                    filepath = os.path.join(repodata_dir, filename)
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+        
+        # Write updated repomd.xml
+        tree.write(repomd_path, encoding='utf-8', xml_declaration=True)
+        
+        # Strip namespaces from repomd.xml (DNF compatibility)
+        with open(repomd_path, 'r', encoding='utf-8') as f:
+            xml_content = f.read()
+        
         xml_content = re.sub(r'<repo:', '<', xml_content)
         xml_content = re.sub(r'</repo:', '</', xml_content)
         xml_content = re.sub(r' xmlns:repo="[^"]*"', '', xml_content)
@@ -1151,6 +1196,44 @@ class YumRepo:
         return sha256.hexdigest()
 
 
+def load_config():
+    """
+    Load configuration from file
+    
+    Searches for config in order:
+    1. ./yums3.conf (current directory)
+    2. ~/.yums3.conf (user home)
+    3. /etc/yums3.conf (system-wide)
+    
+    Returns:
+        dict: Configuration dictionary
+    """
+    config_locations = [
+        'yums3.conf',
+        os.path.expanduser('~/.yums3.conf'),
+        '/etc/yums3.conf'
+    ]
+    
+    default_config = {
+        's3_bucket': None,
+        'local_repo_base': None
+    }
+    
+    for config_path in config_locations:
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    user_config = json.load(f)
+                    default_config.update(user_config)
+                    print(Colors.info(f"Loaded config from: {config_path}"))
+                    break
+            except (json.JSONDecodeError, IOError) as e:
+                print(Colors.warning(f"Failed to load config from {config_path}: {e}"))
+                continue
+    
+    return default_config
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Manage YUM repository in S3',
@@ -1162,6 +1245,13 @@ Examples:
   Batch add:      %(prog)s -y pkg1.rpm pkg2.rpm pkg3.rpm
   Validate repo:  %(prog)s --validate el9/x86_64
   Skip validation: %(prog)s --no-validate package.rpm
+
+Configuration:
+  Create ~/.yums3.conf or /etc/yums3.conf with:
+  {
+    "s3_bucket": "your-bucket-name",
+    "local_repo_base": "/path/to/cache"
+  }
         """
     )
     
@@ -1176,8 +1266,12 @@ Examples:
         help='Skip confirmation prompt (for CI/CD)'
     )
     parser.add_argument(
+        '-b', '--bucket',
+        help='S3 bucket name (overrides config file)'
+    )
+    parser.add_argument(
         '-d', '--repo-dir',
-        help='Custom local repository base directory (default: ~/yum-repo)'
+        help='Custom local repository base directory (overrides config file)'
     )
     parser.add_argument(
         '--remove',
@@ -1197,11 +1291,18 @@ Examples:
     
     args = parser.parse_args()
     
+    # Load configuration with precedence: config file < CLI args
+    config = load_config()
+    
     try:
+        # Apply CLI argument overrides
+        s3_bucket = args.bucket if args.bucket else config['s3_bucket']
+        local_repo_base = args.repo_dir if args.repo_dir else config['local_repo_base']
+        
         # Initialize repository manager
         repo = YumRepo(
-            s3_bucket_name="deepgram-yum-repo",
-            local_repo_base=args.repo_dir,
+            s3_bucket_name=s3_bucket,
+            local_repo_base=local_repo_base,
             skip_validation=args.no_validate
         )
         
