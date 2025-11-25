@@ -19,12 +19,19 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 import json
+import bz2
 
 try:
     import boto3
     from botocore.exceptions import ClientError, NoCredentialsError
 except ImportError:
     print("ERROR: boto3 is not installed. Install it with: pip install boto3")
+    sys.exit(1)
+
+try:
+    from sqlite_metadata import SQLiteMetadataManager
+except ImportError:
+    print("ERROR: sqlite_metadata.py not found in the same directory")
     sys.exit(1)
 
 
@@ -63,7 +70,7 @@ class Colors:
 class YumRepo:
     """YUM repository manager for S3-backed repositories"""
     
-    def __init__(self, s3_bucket_name, local_repo_base=None, skip_validation=False):
+    def __init__(self, s3_bucket_name, local_repo_base=None, skip_validation=False, aws_profile=None):
         """
         Initialize YUM repository manager
         
@@ -71,21 +78,30 @@ class YumRepo:
             s3_bucket_name: Name of the S3 bucket
             local_repo_base: Base directory for local repo cache (default: ~/yum-repo)
             skip_validation: Skip post-operation validation
+            aws_profile: AWS profile to use (overrides AWS_PROFILE env var)
         """
         self.s3_bucket_name = s3_bucket_name
         self.local_repo_base = local_repo_base or os.path.expanduser("~/yum-repo")
         self.backup_metadata = None  # Store backup metadata location
         self.skip_validation = skip_validation
         
-        # Initialize boto3 clients
-        try:
-            self.s3_client = boto3.client('s3')
-            self.sts_client = boto3.client('sts')
-            session = boto3.Session()
-            self.aws_region = session.region_name
+        # Determine AWS profile (precedence: parameter > env var > default)
+        if aws_profile:
+            self.aws_profile = aws_profile
+            os.environ['AWS_PROFILE'] = aws_profile
+        else:
             self.aws_profile = os.environ.get('AWS_PROFILE', 'default')
+        
+        # Initialize boto3 clients with profile
+        try:
+            session = boto3.Session(profile_name=self.aws_profile if self.aws_profile != 'default' else None)
+            self.s3_client = session.client('s3')
+            self.sts_client = session.client('sts')
+            self.aws_region = session.region_name
         except NoCredentialsError:
-            print("ERROR: AWS credentials not found")
+            print(Colors.error("ERROR: AWS credentials not found"))
+            print(Colors.info(f"Attempted to use profile: {self.aws_profile}"))
+            print(Colors.info("Set AWS_PROFILE environment variable or add --profile argument"))
             sys.exit(1)
     
     def add_packages(self, rpm_files):
@@ -536,6 +552,24 @@ class YumRepo:
             with gzip.open(existing_other, 'wt', encoding='utf-8') as f:
                 existing_tree.write(f, encoding='unicode', xml_declaration=True)
         
+        # Create SQLite databases from XML files
+        print("Creating SQLite databases...")
+        sqlite_mgr = SQLiteMetadataManager(repodata_dir)
+        
+        metadata_xml_files = {
+            'primary': existing_primary,
+        }
+        if 'filelists' in existing_files:
+            metadata_xml_files['filelists'] = os.path.join(repodata_dir, existing_files['filelists'])
+        if 'other' in existing_files:
+            metadata_xml_files['other'] = os.path.join(repodata_dir, existing_files['other'])
+        
+        # Create and compress databases
+        db_files = sqlite_mgr.create_all_databases(metadata_xml_files)
+        compressed_dbs = {}
+        for db_type, db_path in db_files.items():
+            compressed_dbs[db_type] = sqlite_mgr.compress_sqlite(db_path)
+        
         # Update repomd.xml with new checksums and rename files
         repomd_path = os.path.join(repodata_dir, 'repomd.xml')
         repomd_tree = ET.parse(repomd_path)
@@ -614,8 +648,14 @@ class YumRepo:
                 if timestamp_elem is not None:
                     timestamp_elem.text = str(int(datetime.now().timestamp()))
         
+        # Add SQLite database entries to repomd.xml
+        for db_type, db_path in compressed_dbs.items():
+            self._add_database_to_repomd(repomd_root, repodata_dir, db_type, db_path)
+        
         # Update revision
         revision_elem = repomd_root.find('repo:revision', NS)
+        if revision_elem is None:
+            revision_elem = repomd_root.find('revision')
         if revision_elem is not None:
             revision_elem.text = str(int(datetime.now().timestamp()))
         
@@ -633,48 +673,47 @@ class YumRepo:
         
         with open(repomd_path, 'w', encoding='utf-8') as f:
             f.write(xml_content)
-        
-        # Remove SQLite database entries and files
-        self._remove_sqlite_databases(repo_dir)
     
-    def _remove_sqlite_databases(self, repo_dir):
-        """Remove SQLite database entries from repomd.xml and delete .sqlite files"""
-        repodata_dir = os.path.join(repo_dir, 'repodata')
-        repomd_path = os.path.join(repodata_dir, 'repomd.xml')
+    def _add_database_to_repomd(self, repomd_root, repodata_dir, db_type, db_path):
+        """Add SQLite database entry to repomd.xml"""
+        filename = os.path.basename(db_path)
+        checksum = self.calculate_checksum(db_path)
+        size = os.path.getsize(db_path)
+        timestamp = int(datetime.now().timestamp())
         
-        # Parse repomd.xml
-        tree = ET.parse(repomd_path)
-        root = tree.getroot()
+        # Calculate checksum of uncompressed database
+        with bz2.open(db_path, 'rb') as f:
+            uncompressed_data = f.read()
+            open_checksum = hashlib.sha256(uncompressed_data).hexdigest()
+            open_size = len(uncompressed_data)
         
-        # Find and remove all *_db entries
-        data_elements = root.findall('data')
-        for data in data_elements:
-            data_type = data.get('type')
-            if data_type and data_type.endswith('_db'):
-                root.remove(data)
-                
-                # Get filename and delete the file
-                location = data.find('location')
-                if location is not None:
-                    filename = location.get('href').replace('repodata/', '')
-                    filepath = os.path.join(repodata_dir, filename)
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
+        # Rename file to match checksum
+        new_filename = f"{checksum}-{db_type}.sqlite.bz2"
+        new_path = os.path.join(repodata_dir, new_filename)
+        os.rename(db_path, new_path)
         
-        # Write updated repomd.xml
-        tree.write(repomd_path, encoding='utf-8', xml_declaration=True)
+        # Create data element
+        data_elem = ET.SubElement(repomd_root, 'data', {'type': db_type})
         
-        # Strip namespaces from repomd.xml (DNF compatibility)
-        with open(repomd_path, 'r', encoding='utf-8') as f:
-            xml_content = f.read()
+        checksum_elem = ET.SubElement(data_elem, 'checksum', {'type': 'sha256'})
+        checksum_elem.text = checksum
         
-        xml_content = re.sub(r'<repo:', '<', xml_content)
-        xml_content = re.sub(r'</repo:', '</', xml_content)
-        xml_content = re.sub(r' xmlns:repo="[^"]*"', '', xml_content)
-        xml_content = re.sub(r' xmlns:rpm="[^"]*"', '', xml_content)
+        open_checksum_elem = ET.SubElement(data_elem, 'open-checksum', {'type': 'sha256'})
+        open_checksum_elem.text = open_checksum
         
-        with open(repomd_path, 'w', encoding='utf-8') as f:
-            f.write(xml_content)
+        location_elem = ET.SubElement(data_elem, 'location', {'href': f'repodata/{new_filename}'})
+        
+        timestamp_elem = ET.SubElement(data_elem, 'timestamp')
+        timestamp_elem.text = str(timestamp)
+        
+        size_elem = ET.SubElement(data_elem, 'size')
+        size_elem.text = str(size)
+        
+        open_size_elem = ET.SubElement(data_elem, 'open-size')
+        open_size_elem.text = str(open_size)
+        
+        database_version_elem = ET.SubElement(data_elem, 'database_version')
+        database_version_elem.text = '10'
     
     def _manipulate_metadata(self, repo_dir, packages_to_remove):
         """Directly manipulate YUM metadata to remove packages"""
@@ -805,8 +844,43 @@ class YumRepo:
                 if timestamp_elem is not None:
                     timestamp_elem.text = str(int(datetime.now().timestamp()))
         
+        # Create SQLite databases from updated XML files
+        print("  Creating SQLite databases...")
+        sqlite_mgr = SQLiteMetadataManager(repodata_dir)
+        
+        # Remove old SQLite databases from repomd.xml
+        for data in list(repomd_root.findall('repo:data', NS)):
+            if data.get('type', '').endswith('_db'):
+                repomd_root.remove(data)
+        
+        # Also check without namespace
+        for data in list(repomd_root.findall('data')):
+            if data.get('type', '').endswith('_db'):
+                repomd_root.remove(data)
+        
+        # Build metadata file dict
+        metadata_xml_files = {}
+        if primary_file:
+            metadata_xml_files['primary'] = primary_path
+        if filelists_file:
+            metadata_xml_files['filelists'] = filelists_path
+        if other_file:
+            metadata_xml_files['other'] = other_path
+        
+        # Create and compress databases
+        db_files = sqlite_mgr.create_all_databases(metadata_xml_files)
+        compressed_dbs = {}
+        for db_type, db_path in db_files.items():
+            compressed_dbs[db_type] = sqlite_mgr.compress_sqlite(db_path)
+        
+        # Add SQLite database entries to repomd.xml
+        for db_type, db_path in compressed_dbs.items():
+            self._add_database_to_repomd(repomd_root, repodata_dir, db_type, db_path)
+        
         # Update repomd.xml revision
         revision_elem = repomd_root.find('repo:revision', NS)
+        if revision_elem is None:
+            revision_elem = repomd_root.find('revision')
         if revision_elem is not None:
             revision_elem.text = str(int(datetime.now().timestamp()))
         
@@ -1047,6 +1121,72 @@ class YumRepo:
             print(Colors.success("  ✓ Repository consistency OK"))
         
         print()
+        print(Colors.bold("3. Checking SQLite databases..."))
+        
+        # Check for SQLite database files
+        db_types = ['primary_db', 'filelists_db', 'other_db']
+        db_found = []
+        db_missing = []
+        
+        for db_type in db_types:
+            if db_type in metadata_files:
+                db_found.append(db_type)
+                db_file = metadata_files[db_type]['filename']
+                db_path = os.path.join(repo_dir, 'repodata', db_file)
+                
+                # Verify database can be opened
+                try:
+                    # Decompress and check
+                    with bz2.open(db_path, 'rb') as f:
+                        db_data = f.read()
+                    
+                    # Try to open as SQLite
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                        tmp.write(db_data)
+                        tmp_path = tmp.name
+                    
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(tmp_path)
+                        cursor = conn.cursor()
+                        
+                        # Check db_info table exists
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='db_info'")
+                        if not cursor.fetchone():
+                            issues.append(f"{db_type}: missing db_info table")
+                        
+                        # Check packages table exists
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='packages'")
+                        if not cursor.fetchone():
+                            issues.append(f"{db_type}: missing packages table")
+                        else:
+                            # Count packages in database
+                            cursor.execute("SELECT COUNT(*) FROM packages")
+                            db_count = cursor.fetchone()[0]
+                            
+                            # Compare with XML count
+                            if primary_file and db_type == 'primary_db':
+                                if db_count != actual_count:
+                                    issues.append(f"{db_type}: package count mismatch (DB: {db_count}, XML: {actual_count})")
+                        
+                        conn.close()
+                    finally:
+                        os.unlink(tmp_path)
+                    
+                except Exception as e:
+                    issues.append(f"{db_type}: failed to validate - {e}")
+            else:
+                db_missing.append(db_type)
+        
+        if db_found:
+            print(Colors.success(f"  ✓ Found {len(db_found)} SQLite database(s): {', '.join(db_found)}"))
+        
+        if db_missing:
+            warnings.append(f"Missing SQLite databases: {', '.join(db_missing)}")
+            print(Colors.warning(f"  ⚠ Missing: {', '.join(db_missing)}"))
+        
+        print()
         print(Colors.bold("Summary:"))
         if issues:
             print(Colors.error(f"  ✗ {len(issues)} error(s) found"))
@@ -1236,21 +1376,22 @@ def load_config():
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Manage YUM repository in S3',
+        description='Efficient YUM repository manager for S3',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  Add RPMs:       %(prog)s package.rpm
-  Remove RPMs:    %(prog)s --remove package-1.0-1.el9.x86_64.rpm
-  Batch add:      %(prog)s -y pkg1.rpm pkg2.rpm pkg3.rpm
-  Validate repo:  %(prog)s --validate el9/x86_64
-  Skip validation: %(prog)s --no-validate package.rpm
+examples:
+  %(prog)s package.rpm                              add package to repository
+  %(prog)s pkg1.rpm pkg2.rpm pkg3.rpm               add multiple packages
+  %(prog)s --remove package-1.0-1.el9.x86_64.rpm    remove package
+  %(prog)s --validate el9/x86_64                    validate repository
+  %(prog)s -y package.rpm                           skip confirmation
 
-Configuration:
-  Create ~/.yums3.conf or /etc/yums3.conf with:
+configuration:
+  Create ~/.yums3.conf or /etc/yums3.conf:
   {
     "s3_bucket": "your-bucket-name",
-    "local_repo_base": "/path/to/cache"
+    "local_repo_base": "/path/to/cache",
+    "aws_profile": "your-profile"
   }
         """
     )
@@ -1288,6 +1429,10 @@ Configuration:
         action='store_true',
         help='Skip post-operation validation'
     )
+    parser.add_argument(
+        '--profile',
+        help='AWS profile to use (overrides config file and AWS_PROFILE env var)'
+    )
     
     args = parser.parse_args()
     
@@ -1298,12 +1443,14 @@ Configuration:
         # Apply CLI argument overrides
         s3_bucket = args.bucket if args.bucket else config['s3_bucket']
         local_repo_base = args.repo_dir if args.repo_dir else config['local_repo_base']
+        aws_profile = args.profile if args.profile else config.get('aws_profile')
         
         # Initialize repository manager
         repo = YumRepo(
             s3_bucket_name=s3_bucket,
             local_repo_base=local_repo_base,
-            skip_validation=args.no_validate
+            skip_validation=args.no_validate,
+            aws_profile=aws_profile
         )
         
         # Handle validation command
@@ -1345,6 +1492,7 @@ Configuration:
         print(Colors.bold("Configuration:"))
         print(f"  AWS Account:  {aws_info['account']}")
         print(f"  AWS Region:   {aws_info['region']}")
+        print(f"  AWS Profile:  {Colors.bold(repo.aws_profile)}")
         print(f"  Target:       {target}")
         print(f"  Action:       {Colors.bold(action)}")
         print(f"  Packages:     {len(args.rpm_files)}")

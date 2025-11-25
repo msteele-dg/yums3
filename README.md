@@ -6,8 +6,10 @@ A lightweight Python tool for managing YUM/DNF repositories hosted on Amazon S3.
 
 - **Efficient Updates**: Add or remove packages without downloading existing RPMs
 - **Metadata Manipulation**: Direct XML manipulation for fast operations
+- **SQLite Database Support**: Creates and maintains SQLite metadata for faster DNF/YUM queries
 - **S3 Native**: Built specifically for S3-backed repositories
 - **Auto-Detection**: Automatically detects architecture and EL version from RPMs
+- **Validation**: Built-in repository integrity checks (XML + SQLite databases)
 
 ## Requirements
 
@@ -578,8 +580,47 @@ This tool is designed for specific use cases. If you need additional features:
 
 This tool is provided as-is for managing YUM repositories on S3. Modify as needed for your use case.
 
+## SQLite Database Support
+
+yums3 automatically creates and maintains SQLite databases alongside XML metadata. This provides:
+
+- **Faster queries**: DNF/YUM can use indexed database queries instead of parsing XML
+- **Lower memory usage**: Clients don't need to load entire XML files into memory
+- **Better performance**: Especially noticeable with large repositories (1000+ packages)
+
+### What Gets Created
+
+For each repository, yums3 creates:
+
+- `*-primary.xml.gz` + `*-primary_db.sqlite.bz2`
+- `*-filelists.xml.gz` + `*-filelists_db.sqlite.bz2`
+- `*-other.xml.gz` + `*-other_db.sqlite.bz2`
+
+Both XML and SQLite are kept in sync automatically.
+
+### Testing SQLite Integration
+
+Run the test suite to verify SQLite support:
+
+```bash
+./test_sqlite_integration.py
+```
+
+This validates:
+- SQLite database creation from XML
+- Database schema correctness
+- Package count consistency
+- DNF compatibility (if dnf is installed)
+
+### Disabling SQLite (Not Recommended)
+
+If you need XML-only metadata, you can modify `yums3.py` to skip SQLite generation. However, this will result in slower DNF/YUM operations for clients.
+
+See `SQLITE_INTEGRATION.md` for detailed technical documentation.
+
 ## See Also
 
 - [createrepo_c documentation](https://github.com/rpm-software-management/createrepo_c)
 - [YUM repository format](https://docs.fedoraproject.org/en-US/quick-docs/repositories/)
 - [DNF documentation](https://dnf.readthedocs.io/)
+- [SQLite Integration Details](SQLITE_INTEGRATION.md)
