@@ -1,4 +1,4 @@
 {
-  "s3_bucket": "your-bucket-name",
-  "local_repo_base": null
+  "backend.s3.bucket": "your-bucket-name",
+  "backend.type": "s3"
 }

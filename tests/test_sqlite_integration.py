@@ -42,8 +42,11 @@ def test_sqlite_metadata_module():
     """Test that sqlite_metadata module can be imported"""
     print_test("Import sqlite_metadata module")
     
+    # Add parent directory to path
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    
     try:
-        from sqlite_metadata import SQLiteMetadataManager
+        from core.sqlite_metadata import SQLiteMetadataManager
         print_pass("Module imported successfully")
         return True
     except ImportError as e:
@@ -56,7 +59,7 @@ def test_create_sample_metadata():
     print_test("Create SQLite databases from XML")
     
     try:
-        from sqlite_metadata import SQLiteMetadataManager
+        from core.sqlite_metadata import SQLiteMetadataManager
         
         # Create temporary directory
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -241,76 +244,166 @@ def test_repomd_integration():
     return True
 
 
+def setup_test_repository():
+    """Setup a local test repository with test RPMs"""
+    print_test("Setting up test repository")
+    
+    # Find test RPMs (in parent directory)
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    test_rpms_dir = os.path.join(script_dir, 'test_rpms')
+    
+    test_rpms = [
+        os.path.join(test_rpms_dir, 'hello-world-1.0.0-1.el9.x86_64.rpm'),
+        os.path.join(test_rpms_dir, 'goodbye-forever-2.0.0-1.el9.x86_64.rpm')
+    ]
+    
+    # Check if test RPMs exist
+    for rpm in test_rpms:
+        if not os.path.exists(rpm):
+            print_fail(f"Test RPM not found: {rpm}")
+            print_info("Run: cd test_rpms && ./build_test_rpms.sh")
+            return None
+    
+    print_info(f"Found {len(test_rpms)} test RPMs")
+    
+    # Create temporary repository
+    test_repo_dir = tempfile.mkdtemp(prefix='yums3-test-repo-')
+    print_info(f"Created test repo: {test_repo_dir}")
+    
+    try:
+        # Copy RPMs to repo
+        for rpm in test_rpms:
+            shutil.copy(rpm, test_repo_dir)
+            print_info(f"  Added: {os.path.basename(rpm)}")
+        
+        # Create repository metadata WITH SQLite databases (default behavior)
+        import subprocess
+        result = subprocess.run(
+            ['createrepo_c', test_repo_dir],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print_fail(f"createrepo_c failed: {result.stderr}")
+            shutil.rmtree(test_repo_dir)
+            return None
+        
+        print_pass("Test repository created with SQLite databases")
+        
+        # Verify SQLite databases were created
+        repodata_dir = os.path.join(test_repo_dir, 'repodata')
+        db_files = [f for f in os.listdir(repodata_dir) if f.endswith('.sqlite.bz2')]
+        print_info(f"  Found {len(db_files)} SQLite database file(s)")
+        
+        return test_repo_dir
+        
+    except Exception as e:
+        print_fail(f"Failed to setup test repository: {e}")
+        import traceback
+        traceback.print_exc()
+        if os.path.exists(test_repo_dir):
+            shutil.rmtree(test_repo_dir)
+        return None
+
+
 def test_dnf_compatibility():
     """Test that the repository is compatible with dnf"""
     print_test("DNF compatibility check")
     
-    print_info("This test checks if dnf can read the repository")
-    print_info("Requires: dnf installed and a test repository")
+    print_info("This test checks if dnf can read a local test repository")
+    print_info("Requires: dnf installed")
     
     # Check if dnf is available
     if shutil.which('dnf') is None:
         print_info("dnf not found, skipping compatibility test")
         return True
     
-    test_repo = os.path.expanduser("~/yum-repo")
-    if not os.path.exists(test_repo):
-        print_info(f"No test repository found at {test_repo}")
-        return True
+    # Setup test repository
+    test_repo_dir = setup_test_repository()
+    if not test_repo_dir:
+        print_fail("Failed to setup test repository")
+        return False
     
-    # Find first repo directory
-    for root, dirs, files in os.walk(test_repo):
-        if 'repodata' in dirs:
-            repo_path = root
-            print_info(f"Testing repository: {repo_path}")
-            
-            # Create temporary repo config
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.repo', delete=False) as f:
-                f.write(f"""[test-repo]
-name=Test Repository
-baseurl=file://{repo_path}
-enabled=1
-gpgcheck=0
-""")
-                repo_config = f.name
-            
-            try:
-                import subprocess
+    print_info(f"Testing repository: {test_repo_dir}")
+    
+    try:
+        import subprocess
+        
+        # Try to list packages from local repository
+        result = subprocess.run(
+            ['dnf', 'repoquery', '--repofrompath', f'test,file://{test_repo_dir}', 
+             '--repo', 'test', '-a'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            packages = [p for p in result.stdout.strip().split('\n') if p]
+            if packages:
+                print_pass(f"dnf can read repository ({len(packages)} packages found)")
                 
-                # Try to list packages
-                result = subprocess.run(
-                    ['dnf', 'repoquery', '--repofrompath', f'test,file://{repo_path}', 
-                     '--repo', 'test', '--disablerepo=*', '--enablerepo=test', '-a'],
+                # Show packages
+                for pkg in packages:
+                    print_info(f"  - {pkg}")
+                
+                # Verify we got the expected packages
+                expected_packages = ['hello-world', 'goodbye-forever']
+                packages_str = ' '.join(packages)
+                
+                for expected in expected_packages:
+                    if expected in packages_str:
+                        print_pass(f"Found expected package: {expected}")
+                    else:
+                        print_fail(f"Missing expected package: {expected}")
+                        shutil.rmtree(test_repo_dir)
+                        return False
+                
+                # Verify SQLite databases are being used (check for fast response)
+                print_info("Verifying SQLite database usage...")
+                import time
+                start = time.time()
+                result2 = subprocess.run(
+                    ['dnf', 'repoquery', '--repofrompath', f'test,file://{test_repo_dir}', 
+                     '--repo', 'test', '--whatprovides', 'hello-world'],
                     capture_output=True,
                     text=True,
                     timeout=30
                 )
+                elapsed = time.time() - start
                 
-                if result.returncode == 0:
-                    packages = result.stdout.strip().split('\n')
-                    if packages and packages[0]:
-                        print_pass(f"dnf can read repository ({len(packages)} packages)")
-                        return True
-                    else:
-                        print_info("Repository is empty or dnf returned no packages")
-                        return True
-                else:
-                    print_fail(f"dnf failed: {result.stderr}")
-                    return False
+                if result2.returncode == 0 and result2.stdout.strip():
+                    print_pass(f"SQLite queries working (query took {elapsed:.2f}s)")
                     
-            except subprocess.TimeoutExpired:
-                print_fail("dnf command timed out")
+                    # Cleanup
+                    shutil.rmtree(test_repo_dir)
+                    return True
+                else:
+                    print_fail("SQLite query failed")
+                    shutil.rmtree(test_repo_dir)
+                    return False
+            else:
+                print_fail("Repository returned no packages")
+                shutil.rmtree(test_repo_dir)
                 return False
-            except Exception as e:
-                print_fail(f"Exception: {e}")
-                return False
-            finally:
-                if os.path.exists(repo_config):
-                    os.unlink(repo_config)
+        else:
+            print_fail(f"dnf failed: {result.stderr}")
+            shutil.rmtree(test_repo_dir)
+            return False
             
-            break
-    
-    return True
+    except subprocess.TimeoutExpired:
+        print_fail("dnf command timed out")
+        if test_repo_dir and os.path.exists(test_repo_dir):
+            shutil.rmtree(test_repo_dir)
+        return False
+    except Exception as e:
+        print_fail(f"Exception: {e}")
+        import traceback
+        traceback.print_exc()
+        if test_repo_dir and os.path.exists(test_repo_dir):
+            shutil.rmtree(test_repo_dir)
+        return False
 
 
 def main():

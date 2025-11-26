@@ -39,19 +39,25 @@ apt-get install createrepo-c rpm
 Add one or more RPM packages to your repository:
 
 ```bash
-./yums3.py my-package-1.0.0-1.el9.x86_64.rpm
+./yums3.py add my-package-1.0.0-1.el9.x86_64.rpm
 ```
 
 Add multiple packages at once:
 
 ```bash
-./yums3.py package1.rpm package2.rpm package3.rpm
+./yums3.py add package1.rpm package2.rpm package3.rpm
+```
+
+Add packages using glob patterns:
+
+```bash
+./yums3.py add /tmp/rpmbuild/RPMS/x86_64/*.rpm
 ```
 
 Skip confirmation prompt (useful for CI/CD):
 
 ```bash
-./yums3.py -y my-package.rpm
+./yums3.py add -y my-package.rpm
 ```
 
 ### Removing Packages
@@ -59,21 +65,19 @@ Skip confirmation prompt (useful for CI/CD):
 Remove packages by filename:
 
 ```bash
-./yums3.py --remove my-package-1.0.0-1.el9.x86_64.rpm
+./yums3.py remove my-package-1.0.0-1.el9.x86_64.rpm
 ```
 
 Remove multiple packages:
 
 ```bash
-./yums3.py --remove old-package1.rpm old-package2.rpm
+./yums3.py remove old-package1.rpm old-package2.rpm
 ```
 
-### Custom Repository Location
-
-Use a custom local cache directory:
+Skip confirmation prompt:
 
 ```bash
-./yums3.py -d /tmp/my-repo-cache my-package.rpm
+./yums3.py remove -y old-package.rpm
 ```
 
 ### Validating Repository
@@ -81,7 +85,7 @@ Use a custom local cache directory:
 Perform full validation of a repository:
 
 ```bash
-./yums3.py --validate el9/x86_64
+./yums3.py validate el9/x86_64
 ```
 
 This checks:
@@ -92,10 +96,46 @@ This checks:
 Skip post-operation validation (for speed):
 
 ```bash
-./yums3.py --no-validate my-package.rpm
+./yums3.py add --no-validate my-package.rpm
+./yums3.py remove --no-validate old-package.rpm
 ```
 
 **Note**: Quick validation runs automatically after add/remove operations unless `--no-validate` is specified.
+
+### Configuration Management
+
+Get configuration values:
+
+```bash
+./yums3.py config backend.type
+```
+
+Set configuration values:
+
+```bash
+./yums3.py config backend.s3.bucket my-bucket
+```
+
+List all configuration:
+
+```bash
+./yums3.py config --list
+```
+
+### Global Options
+
+Override configuration with command-line options:
+
+```bash
+# Use different bucket
+./yums3.py --bucket other-bucket add my-package.rpm
+
+# Use different cache directory
+./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
+
+# Use different AWS profile
+./yums3.py --profile production add my-package.rpm
+```
 
 ## How It Works
 
@@ -187,16 +227,22 @@ Create a configuration file to avoid specifying options every time:
 
 **Example:**
 ```bash
-# Create user config
+# Create user config using config command
+./yums3.py config backend.type s3
+./yums3.py config backend.s3.bucket my-company-yum-repo
+./yums3.py config repo.cache_dir /tmp/yum-cache
+
+# Or create manually
 cat > ~/.yums3.conf <<EOF
 {
-  "s3_bucket": "my-company-yum-repo",
-  "local_repo_base": "/tmp/yum-cache"
+  "backend.type": "s3",
+  "backend.s3.bucket": "my-company-yum-repo",
+  "repo.cache_dir": "/tmp/yum-cache"
 }
 EOF
 
 # Now you can run without specifying bucket
-./yums3.py my-package.rpm
+./yums3.py add my-package.rpm
 ```
 
 ### Command-Line Overrides
@@ -205,10 +251,13 @@ CLI arguments override config file values:
 
 ```bash
 # Use different bucket (overrides config)
-./yums3.py --bucket other-bucket my-package.rpm
+./yums3.py --bucket other-bucket add my-package.rpm
 
 # Use different cache directory (overrides config)
-./yums3.py --repo-dir /tmp/custom-cache my-package.rpm
+./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
+
+# Use different AWS profile (overrides config)
+./yums3.py --profile production add my-package.rpm
 ```
 
 ### S3 Bucket
@@ -580,6 +629,50 @@ This tool is designed for specific use cases. If you need additional features:
 
 This tool is provided as-is for managing YUM repositories on S3. Modify as needed for your use case.
 
+## Project Structure
+
+```
+yums3/
+├── core/                    # Core modules
+│   ├── __init__.py
+│   ├── backend.py          # Storage backend abstraction
+│   ├── config.py           # Configuration management
+│   └── sqlite_metadata.py  # SQLite database generation
+├── tests/                   # Test suite
+│   ├── test_config.py
+│   ├── test_config_command.py
+│   ├── test_storage_backend.py
+│   ├── test_sqlite_integration.py
+│   └── ...
+├── docs/                    # Documentation
+│   ├── CONFIG_COMMAND_REFERENCE.md
+│   ├── YUMCONFIG_COMPLETE.md
+│   ├── STORAGE_BACKEND_INTEGRATION.md
+│   └── ...
+├── test_rpms/              # Test RPM packages
+├── yums3.py                # Main script
+└── README.md               # This file
+```
+
+## Testing
+
+Run the test suite to verify functionality:
+
+```bash
+# Test configuration management
+python3 tests/test_config.py
+python3 tests/test_config_command.py
+
+# Test storage backends
+python3 tests/test_storage_backend.py
+
+# Test SQLite integration
+python3 tests/test_sqlite_integration.py
+
+# Test DNF compatibility (requires dnf)
+python3 tests/test_dnf_compatibility.py
+```
+
 ## SQLite Database Support
 
 yums3 automatically creates and maintains SQLite databases alongside XML metadata. This provides:
@@ -598,29 +691,17 @@ For each repository, yums3 creates:
 
 Both XML and SQLite are kept in sync automatically.
 
-### Testing SQLite Integration
+## Documentation
 
-Run the test suite to verify SQLite support:
+See the `docs/` directory for detailed documentation:
 
-```bash
-./test_sqlite_integration.py
-```
-
-This validates:
-- SQLite database creation from XML
-- Database schema correctness
-- Package count consistency
-- DNF compatibility (if dnf is installed)
-
-### Disabling SQLite (Not Recommended)
-
-If you need XML-only metadata, you can modify `yums3.py` to skip SQLite generation. However, this will result in slower DNF/YUM operations for clients.
-
-See `SQLITE_INTEGRATION.md` for detailed technical documentation.
+- **[CONFIG_COMMAND_REFERENCE.md](docs/CONFIG_COMMAND_REFERENCE.md)** - Complete config command reference
+- **[YUMCONFIG_COMPLETE.md](docs/YUMCONFIG_COMPLETE.md)** - Configuration system documentation
+- **[STORAGE_BACKEND_INTEGRATION.md](docs/STORAGE_BACKEND_INTEGRATION.md)** - Storage backend details
+- **[DOT_NOTATION_CONFIG_DESIGN.md](docs/DOT_NOTATION_CONFIG_DESIGN.md)** - Configuration design
 
 ## See Also
 
 - [createrepo_c documentation](https://github.com/rpm-software-management/createrepo_c)
 - [YUM repository format](https://docs.fedoraproject.org/en-US/quick-docs/repositories/)
 - [DNF documentation](https://dnf.readthedocs.io/)
-- [SQLite Integration Details](SQLITE_INTEGRATION.md)
