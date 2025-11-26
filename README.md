@@ -6,8 +6,10 @@ A lightweight Python tool for managing YUM/DNF repositories hosted on Amazon S3.
 
 - **Efficient Updates**: Add or remove packages without downloading existing RPMs
 - **Metadata Manipulation**: Direct XML manipulation for fast operations
+- **SQLite Database Support**: Creates and maintains SQLite metadata for faster DNF/YUM queries
 - **S3 Native**: Built specifically for S3-backed repositories
 - **Auto-Detection**: Automatically detects architecture and EL version from RPMs
+- **Validation**: Built-in repository integrity checks (XML + SQLite databases)
 
 ## Requirements
 
@@ -37,19 +39,25 @@ apt-get install createrepo-c rpm
 Add one or more RPM packages to your repository:
 
 ```bash
-./yums3.py my-package-1.0.0-1.el9.x86_64.rpm
+./yums3.py add my-package-1.0.0-1.el9.x86_64.rpm
 ```
 
 Add multiple packages at once:
 
 ```bash
-./yums3.py package1.rpm package2.rpm package3.rpm
+./yums3.py add package1.rpm package2.rpm package3.rpm
+```
+
+Add packages using glob patterns:
+
+```bash
+./yums3.py add /tmp/rpmbuild/RPMS/x86_64/*.rpm
 ```
 
 Skip confirmation prompt (useful for CI/CD):
 
 ```bash
-./yums3.py -y my-package.rpm
+./yums3.py add -y my-package.rpm
 ```
 
 ### Removing Packages
@@ -57,21 +65,19 @@ Skip confirmation prompt (useful for CI/CD):
 Remove packages by filename:
 
 ```bash
-./yums3.py --remove my-package-1.0.0-1.el9.x86_64.rpm
+./yums3.py remove my-package-1.0.0-1.el9.x86_64.rpm
 ```
 
 Remove multiple packages:
 
 ```bash
-./yums3.py --remove old-package1.rpm old-package2.rpm
+./yums3.py remove old-package1.rpm old-package2.rpm
 ```
 
-### Custom Repository Location
-
-Use a custom local cache directory:
+Skip confirmation prompt:
 
 ```bash
-./yums3.py -d /tmp/my-repo-cache my-package.rpm
+./yums3.py remove -y old-package.rpm
 ```
 
 ### Validating Repository
@@ -79,7 +85,7 @@ Use a custom local cache directory:
 Perform full validation of a repository:
 
 ```bash
-./yums3.py --validate el9/x86_64
+./yums3.py validate el9/x86_64
 ```
 
 This checks:
@@ -90,10 +96,46 @@ This checks:
 Skip post-operation validation (for speed):
 
 ```bash
-./yums3.py --no-validate my-package.rpm
+./yums3.py add --no-validate my-package.rpm
+./yums3.py remove --no-validate old-package.rpm
 ```
 
 **Note**: Quick validation runs automatically after add/remove operations unless `--no-validate` is specified.
+
+### Configuration Management
+
+Get configuration values:
+
+```bash
+./yums3.py config backend.type
+```
+
+Set configuration values:
+
+```bash
+./yums3.py config backend.s3.bucket my-bucket
+```
+
+List all configuration:
+
+```bash
+./yums3.py config --list
+```
+
+### Global Options
+
+Override configuration with command-line options:
+
+```bash
+# Use different bucket
+./yums3.py --bucket other-bucket add my-package.rpm
+
+# Use different cache directory
+./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
+
+# Use different AWS profile
+./yums3.py --profile production add my-package.rpm
+```
 
 ## How It Works
 
@@ -166,16 +208,61 @@ This tool handles this by:
 
 ## Configuration
 
+### Configuration File
+
+Create a configuration file to avoid specifying options every time:
+
+**Location** (searched in order):
+1. `./yums3.conf` (current directory)
+2. `~/.yums3.conf` (user home)
+3. `/etc/yums3.conf` (system-wide)
+
+**Format** (JSON):
+```json
+{
+  "s3_bucket": "your-bucket-name",
+  "local_repo_base": "/custom/cache/path"
+}
+```
+
+**Example:**
+```bash
+# Create user config using config command
+./yums3.py config backend.type s3
+./yums3.py config backend.s3.bucket my-company-yum-repo
+./yums3.py config repo.cache_dir /tmp/yum-cache
+
+# Or create manually
+cat > ~/.yums3.conf <<EOF
+{
+  "backend.type": "s3",
+  "backend.s3.bucket": "my-company-yum-repo",
+  "repo.cache_dir": "/tmp/yum-cache"
+}
+EOF
+
+# Now you can run without specifying bucket
+./yums3.py add my-package.rpm
+```
+
+### Command-Line Overrides
+
+CLI arguments override config file values:
+
+```bash
+# Use different bucket (overrides config)
+./yums3.py --bucket other-bucket add my-package.rpm
+
+# Use different cache directory (overrides config)
+./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
+
+# Use different AWS profile (overrides config)
+./yums3.py --profile production add my-package.rpm
+```
+
 ### S3 Bucket
 
-By default, the tool uses the bucket `deepgram-yum-repo`. To use a different bucket, modify the `YumRepo` initialization in the script:
-
-```python
-repo = YumRepo(
-    s3_bucket_name="your-bucket-name",
-    local_repo_base=args.repo_dir
-)
-```
+If no configuration file exists and no `--bucket` argument is provided, the default bucket `deepgram-yum-repo` is used.
 
 ### AWS Credentials
 
@@ -541,6 +628,77 @@ This tool is designed for specific use cases. If you need additional features:
 ## License
 
 This tool is provided as-is for managing YUM repositories on S3. Modify as needed for your use case.
+
+## Project Structure
+
+```
+yums3/
+├── core/                    # Core modules
+│   ├── __init__.py
+│   ├── backend.py          # Storage backend abstraction
+│   ├── config.py           # Configuration management
+│   └── sqlite_metadata.py  # SQLite database generation
+├── tests/                   # Test suite
+│   ├── test_config.py
+│   ├── test_config_command.py
+│   ├── test_storage_backend.py
+│   ├── test_sqlite_integration.py
+│   └── ...
+├── docs/                    # Documentation
+│   ├── CONFIG_COMMAND_REFERENCE.md
+│   ├── YUMCONFIG_COMPLETE.md
+│   ├── STORAGE_BACKEND_INTEGRATION.md
+│   └── ...
+├── test_rpms/              # Test RPM packages
+├── yums3.py                # Main script
+└── README.md               # This file
+```
+
+## Testing
+
+Run the test suite to verify functionality:
+
+```bash
+# Test configuration management
+python3 tests/test_config.py
+python3 tests/test_config_command.py
+
+# Test storage backends
+python3 tests/test_storage_backend.py
+
+# Test SQLite integration
+python3 tests/test_sqlite_integration.py
+
+# Test DNF compatibility (requires dnf)
+python3 tests/test_dnf_compatibility.py
+```
+
+## SQLite Database Support
+
+yums3 automatically creates and maintains SQLite databases alongside XML metadata. This provides:
+
+- **Faster queries**: DNF/YUM can use indexed database queries instead of parsing XML
+- **Lower memory usage**: Clients don't need to load entire XML files into memory
+- **Better performance**: Especially noticeable with large repositories (1000+ packages)
+
+### What Gets Created
+
+For each repository, yums3 creates:
+
+- `*-primary.xml.gz` + `*-primary_db.sqlite.bz2`
+- `*-filelists.xml.gz` + `*-filelists_db.sqlite.bz2`
+- `*-other.xml.gz` + `*-other_db.sqlite.bz2`
+
+Both XML and SQLite are kept in sync automatically.
+
+## Documentation
+
+See the `docs/` directory for detailed documentation:
+
+- **[CONFIG_COMMAND_REFERENCE.md](docs/CONFIG_COMMAND_REFERENCE.md)** - Complete config command reference
+- **[YUMCONFIG_COMPLETE.md](docs/YUMCONFIG_COMPLETE.md)** - Configuration system documentation
+- **[STORAGE_BACKEND_INTEGRATION.md](docs/STORAGE_BACKEND_INTEGRATION.md)** - Storage backend details
+- **[DOT_NOTATION_CONFIG_DESIGN.md](docs/DOT_NOTATION_CONFIG_DESIGN.md)** - Configuration design
 
 ## See Also
 

@@ -1,0 +1,5 @@
+{
+  "backend.local.path": "/tmp/yums3-local-repo",
+  "backend.type": "local",
+  "repo.cache_dir": "/tmp/yums3-cache"
+}

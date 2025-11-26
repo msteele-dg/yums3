@@ -1,0 +1,4 @@
+{
+  "backend.s3.bucket": "your-bucket-name",
+  "backend.type": "s3"
+}

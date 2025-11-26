@@ -15,9 +15,22 @@ import subprocess
 import re
 import gzip
 import hashlib
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+import json
+import bz2
+
+from core.backend import StorageBackend, S3StorageBackend, LocalStorageBackend, FileTracker
+from core.config import YumConfig, create_storage_backend_from_config
+from core.sqlite_metadata import SQLiteMetadataManager
+from core import Colors
+
+
+try:
+    from lxml import etree as ET
+except ImportError:
+    print("ERROR: lxml is not installed. Install it with: pip install lxml")
+    sys.exit(1)
 
 try:
     import boto3
@@ -27,65 +40,40 @@ except ImportError:
     sys.exit(1)
 
 
-class Colors:
-    """ANSI color codes for terminal output"""
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    BOLD = '\033[1m'
-    RESET = '\033[0m'
-    
-    @staticmethod
-    def error(msg):
-        return f"{Colors.RED}{msg}{Colors.RESET}"
-    
-    @staticmethod
-    def success(msg):
-        return f"{Colors.GREEN}{msg}{Colors.RESET}"
-    
-    @staticmethod
-    def warning(msg):
-        return f"{Colors.YELLOW}{msg}{Colors.RESET}"
-    
-    @staticmethod
-    def info(msg):
-        return f"{Colors.BLUE}{msg}{Colors.RESET}"
-    
-    @staticmethod
-    def bold(msg):
-        return f"{Colors.BOLD}{msg}{Colors.RESET}"
-
-
 class YumRepo:
-    """YUM repository manager for S3-backed repositories"""
+    """YUM repository manager with pluggable storage backends"""
     
-    def __init__(self, s3_bucket_name="deepgram-yum-repo", local_repo_base=None, skip_validation=False):
+    def __init__(self, config: YumConfig):
         """
         Initialize YUM repository manager
         
         Args:
-            s3_bucket_name: Name of the S3 bucket
-            local_repo_base: Base directory for local repo cache (default: ~/yum-repo)
-            skip_validation: Skip post-operation validation
+            config: YumConfig instance with repository configuration
         """
-        self.s3_bucket_name = s3_bucket_name
-        self.local_repo_base = local_repo_base or os.path.expanduser("~/yum-repo")
+        self.config = config
+        self.storage = create_storage_backend_from_config(config)
+        self.cache_dir = os.path.expanduser(config.get('repo.cache_dir', '~/yum-repo'))
         self.backup_metadata = None  # Store backup metadata location
-        self.skip_validation = skip_validation
+        self.skip_validation = not config.get('validation.enabled', True)
         
-        # Initialize boto3 clients
-        try:
-            self.s3_client = boto3.client('s3')
-            self.sts_client = boto3.client('sts')
-            session = boto3.Session()
-            self.aws_region = session.region_name
-            self.aws_profile = os.environ.get('AWS_PROFILE', 'default')
-        except NoCredentialsError:
-            print("ERROR: AWS credentials not found")
-            sys.exit(1)
+        # For S3-specific AWS info display
+        if isinstance(self.storage, S3StorageBackend):
+            self.s3_bucket_name = self.storage.bucket_name
+            self.aws_profile = self.storage.aws_profile
+            
+            # Initialize STS client for AWS info
+            try:
+                session = boto3.Session(profile_name=self.aws_profile if self.aws_profile != 'default' else None)
+                self.sts_client = session.client('sts')
+                self.aws_region = session.region_name
+            except:
+                self.sts_client = None
+                self.aws_region = None
+        else:
+            self.s3_bucket_name = None
+            self.aws_profile = None
+            self.sts_client = None
+            self.aws_region = None
     
     def add_packages(self, rpm_files):
         """
@@ -106,23 +94,23 @@ class YumRepo:
         self._validate_rpm_compatibility(rpm_files, arch, el_version)
         
         # Setup paths
-        repo_dir = os.path.join(self.local_repo_base, el_version, arch)
-        s3_prefix = f"{el_version}/{arch}"
+        repo_dir = os.path.join(self.cache_dir, el_version, arch)
+        repo_path = f"{el_version}/{arch}"
         
         # Prepare local directory
         self._prepare_repo_dir(repo_dir)
         
-        # Check if repo exists in S3
-        if not self._s3_repo_exists(s3_prefix):
-            self._init_repo(rpm_files, repo_dir, s3_prefix)
+        # Check if repo exists in storage
+        if not self._repo_exists(repo_path):
+            self._init_repo(rpm_files, repo_dir, repo_path)
         else:
-            self._add_to_existing_repo(rpm_files, repo_dir, s3_prefix)
+            self._add_to_existing_repo(rpm_files, repo_dir, repo_path)
         
         # Quick validation after operation
         if not self.skip_validation:
             print()
             print(Colors.info("Validating repository..."))
-            if not self._validate_quick(s3_prefix):
+            if not self._validate_quick(repo_path):
                 print(Colors.warning("⚠ Validation found issues (operation completed but repo may have problems)"))
             else:
                 print(Colors.success("✓ Validation passed"))
@@ -143,26 +131,26 @@ class YumRepo:
             el_version = el_version or el_detected
         
         # Setup paths
-        repo_dir = os.path.join(self.local_repo_base, el_version, arch)
-        s3_prefix = f"{el_version}/{arch}"
+        repo_dir = os.path.join(self.cache_dir, el_version, arch)
+        repo_path = f"{el_version}/{arch}"
         
         # Check repo exists
-        if not self._s3_repo_exists(s3_prefix):
-            raise ValueError(f"Repository does not exist: s3://{self.s3_bucket_name}/{s3_prefix}")
+        if not self._repo_exists(repo_path):
+            raise ValueError(f"Repository does not exist: {self.storage.get_url()}/{repo_path}")
         
         # Prepare local directory
         self._prepare_repo_dir(repo_dir)
         
         print(Colors.info("Removing packages from repository..."))
         print("Downloading metadata...")
-        self._s3_sync_from_s3(f"{s3_prefix}/repodata", f"{repo_dir}/repodata")
+        self.storage.sync_from_storage(f"{repo_path}/repodata", f"{repo_dir}/repodata")
         
-        s3_rpms = self._s3_list_objects(s3_prefix, suffix='.rpm')
+        rpms = self.storage.list_files(repo_path, suffix='.rpm')
         
         # Verify RPMs exist
         missing_count = 0
         for rpm_filename in rpm_filenames:
-            if rpm_filename not in s3_rpms:
+            if rpm_filename not in rpms:
                 print(Colors.warning(f"  ⚠ {rpm_filename} not found in repository"))
                 missing_count += 1
         
@@ -171,39 +159,36 @@ class YumRepo:
         
         # Backup metadata before making changes
         print("Creating metadata backup...")
-        self._backup_metadata(repo_dir, s3_prefix)
+        self._backup_metadata(repo_dir, repo_path)
         
         try:
             print("Updating metadata...")
             self._manipulate_metadata(repo_dir, rpm_filenames)
             
-            # Delete from S3
+            # Delete from storage
             for rpm_filename in rpm_filenames:
-                if rpm_filename in s3_rpms:
-                    self.s3_client.delete_object(
-                        Bucket=self.s3_bucket_name,
-                        Key=f"{s3_prefix}/{rpm_filename}"
-                    )
+                if rpm_filename in rpms:
+                    self.storage.delete_file(f"{repo_path}/{rpm_filename}")
             
             print("Uploading metadata...")
-            self._s3_sync_to_s3(f"{repo_dir}/repodata", f"{s3_prefix}/repodata")
+            self.storage.sync_to_storage(f"{repo_dir}/repodata", f"{repo_path}/repodata")
             
             # Clean up backup on success
             self._cleanup_backup()
             
-            print(Colors.success(f"✓ Removed {len(rpm_filenames)} package{'s' if len(rpm_filenames) > 1 else ''} from s3://{self.s3_bucket_name}/{s3_prefix}"))
+            print(Colors.success(f"✓ Removed {len(rpm_filenames)} package{'s' if len(rpm_filenames) > 1 else ''} from {self.storage.get_url()}/{repo_path}"))
             
         except Exception as e:
             print(Colors.error(f"✗ Operation failed: {e}"))
             print(Colors.warning("Restoring metadata from backup..."))
-            self._restore_metadata(s3_prefix)
+            self._restore_metadata(repo_path)
             raise
         
         # Quick validation after operation
         if not self.skip_validation:
             print()
             print(Colors.info("Validating repository..."))
-            if not self._validate_quick(s3_prefix):
+            if not self._validate_quick(repo_path):
                 print(Colors.warning("⚠ Validation found issues (operation completed but repo may have problems)"))
             else:
                 print(Colors.success("✓ Validation passed"))
@@ -219,33 +204,41 @@ class YumRepo:
         Returns:
             bool: True if validation passed, False otherwise
         """
-        s3_prefix = f"{el_version}/{arch}"
+        repo_path = f"{el_version}/{arch}"
         
         # Check repo exists
-        if not self._s3_repo_exists(s3_prefix):
-            print(Colors.error(f"✗ Repository does not exist: s3://{self.s3_bucket_name}/{s3_prefix}"))
+        if not self._repo_exists(repo_path):
+            print(Colors.error(f"✗ Repository does not exist: {self.storage.get_url()}/{repo_path}"))
             return False
         
-        print(Colors.info(f"Validating repository: s3://{self.s3_bucket_name}/{s3_prefix}"))
+        print(Colors.info(f"Validating repository: {self.storage.get_url()}/{repo_path}"))
         print()
         
         # Setup paths
-        repo_dir = os.path.join(self.local_repo_base, el_version, arch)
+        repo_dir = os.path.join(self.cache_dir, el_version, arch)
         self._prepare_repo_dir(repo_dir)
         
         # Download metadata
         print("Downloading metadata...")
-        self._s3_sync_from_s3(f"{s3_prefix}/repodata", f"{repo_dir}/repodata")
+        self.storage.sync_from_storage(f"{repo_path}/repodata", f"{repo_dir}/repodata")
         
         # Perform full validation
-        return self._validate_full(repo_dir, s3_prefix)
+        return self._validate_full(repo_dir, repo_path)
     
     def get_aws_info(self):
-        """Get AWS configuration information"""
+        """Get AWS configuration information (for S3 backend only)"""
+        if not isinstance(self.storage, S3StorageBackend):
+            return {
+                'account': 'N/A (not using S3)',
+                'region': 'N/A',
+                'profile': 'N/A',
+                's3_url': self.storage.get_url()
+            }
+        
         try:
             identity = self.sts_client.get_caller_identity()
             aws_account = identity['Account']
-        except ClientError:
+        except:
             aws_account = "Unable to determine"
         
         aws_region_env = os.environ.get('AWS_REGION')
@@ -263,7 +256,8 @@ class YumRepo:
         return {
             'account': aws_account,
             'region': aws_region_info,
-            'profile': aws_profile_info
+            'profile': aws_profile_info,
+            's3_url': self.storage.get_url()
         }
     
     # Private helper methods
@@ -330,43 +324,37 @@ class YumRepo:
             subprocess.run(['rm', '-rf', repo_dir], check=True)
         os.makedirs(repo_dir, exist_ok=True)
     
-    def _s3_repo_exists(self, s3_prefix):
-        """Check if repository exists in S3"""
-        try:
-            self.s3_client.head_object(
-                Bucket=self.s3_bucket_name,
-                Key=f"{s3_prefix}/repodata/repomd.xml"
-            )
-            return True
-        except ClientError:
-            return False
+    def _repo_exists(self, prefix):
+        """Check if repository exists in storage"""
+        return self.storage.exists(f"{prefix}/repodata/repomd.xml")
     
-    def _init_repo(self, rpm_files, repo_dir, s3_prefix):
+    def _init_repo(self, rpm_files, repo_dir, repo_path):
         """Initialize a new repository"""
         print(Colors.info("Initializing new repository..."))
         
         for rpm_file in rpm_files:
             subprocess.run(['cp', rpm_file, repo_dir], check=True)
         
+        # Create repo WITH SQLite databases (default behavior)
         subprocess.run(['createrepo_c', repo_dir], check=True, 
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        print("Uploading to S3...")
-        self._s3_sync_to_s3(repo_dir, s3_prefix)
+        print("Uploading to storage...")
+        self.storage.sync_to_storage(repo_dir, repo_path)
         
-        print(Colors.success(f"✓ Published {len(rpm_files)} package{'s' if len(rpm_files) > 1 else ''} to s3://{self.s3_bucket_name}/{s3_prefix}"))
+        print(Colors.success(f"✓ Published {len(rpm_files)} package{'s' if len(rpm_files) > 1 else ''} to {self.storage.get_url()}/{repo_path}"))
         for rpm_file in rpm_files:
             print(f"  • {os.path.basename(rpm_file)}")
     
-    def _add_to_existing_repo(self, rpm_files, repo_dir, s3_prefix):
+    def _add_to_existing_repo(self, rpm_files, repo_dir, repo_path):
         """Add packages to existing repository"""
         print(Colors.info("Updating existing repository..."))
         print("Downloading metadata...")
-        self._s3_sync_from_s3(f"{s3_prefix}/repodata", f"{repo_dir}/repodata")
+        self.storage.sync_from_storage(f"{repo_path}/repodata", f"{repo_dir}/repodata")
         
         # Backup metadata before making changes
         print("Creating metadata backup...")
-        self._backup_metadata(repo_dir, s3_prefix)
+        self._backup_metadata(repo_dir, repo_path)
         
         try:
             temp_repo = f"{repo_dir}.new"
@@ -375,7 +363,8 @@ class YumRepo:
             for rpm_file in rpm_files:
                 subprocess.run(['cp', rpm_file, temp_repo], check=True)
             
-            subprocess.run(['createrepo_c', temp_repo], check=True,
+            # Create metadata without SQLite databases
+            subprocess.run(['createrepo_c', '--no-database', temp_repo], check=True,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             print("Merging metadata...")
@@ -386,34 +375,27 @@ class YumRepo:
             print("Uploading packages...")
             for rpm_file in rpm_files:
                 rpm_basename = os.path.basename(rpm_file)
-                self.s3_client.upload_file(
-                    rpm_file,
-                    self.s3_bucket_name,
-                    f"{s3_prefix}/{rpm_basename}"
-                )
+                self.storage.upload_file(rpm_file, f"{repo_path}/{rpm_basename}")
             
             # Delete all old repodata files before uploading new ones
-            old_metadata = self._s3_list_objects(f"{s3_prefix}/repodata")
+            old_metadata = self.storage.list_files(f"{repo_path}/repodata")
             for old_file in old_metadata:
-                self.s3_client.delete_object(
-                    Bucket=self.s3_bucket_name,
-                    Key=f"{s3_prefix}/repodata/{old_file}"
-                )
+                self.storage.delete_file(f"{repo_path}/repodata/{old_file}")
             
             print("Uploading metadata...")
-            self._s3_sync_to_s3(f"{repo_dir}/repodata", f"{s3_prefix}/repodata")
+            self.storage.sync_to_storage(f"{repo_dir}/repodata", f"{repo_path}/repodata")
             
             # Clean up backup on success
             self._cleanup_backup()
             
-            print(Colors.success(f"✓ Published {len(rpm_files)} package{'s' if len(rpm_files) > 1 else ''} to s3://{self.s3_bucket_name}/{s3_prefix}"))
+            print(Colors.success(f"✓ Published {len(rpm_files)} package{'s' if len(rpm_files) > 1 else ''} to {self.storage.get_url()}/{repo_path}"))
             for rpm_file in rpm_files:
                 print(f"  • {os.path.basename(rpm_file)}")
                 
         except Exception as e:
             print(Colors.error(f"✗ Operation failed: {e}"))
             print(Colors.warning("Restoring metadata from backup..."))
-            self._restore_metadata(s3_prefix)
+            self._restore_metadata(repo_path)
             raise
     
     def _merge_metadata(self, repo_dir, temp_repo, rpm_files):
@@ -485,9 +467,9 @@ class YumRepo:
         current_count = int(existing_root.get('packages', '0'))
         existing_root.set('packages', str(current_count + packages_added))
         
-        # Write merged primary.xml.gz
-        with gzip.open(existing_primary, 'wt', encoding='utf-8') as f:
-            existing_tree.write(f, encoding='unicode', xml_declaration=True)
+        # Write merged primary.xml.gz (lxml handles namespaces correctly)
+        with gzip.open(existing_primary, 'wb') as f:
+            existing_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
         
         # Merge filelists.xml.gz
         if 'filelists' in existing_files and 'filelists' in new_files:
@@ -508,8 +490,9 @@ class YumRepo:
             current_count = int(existing_root.get('packages', '0'))
             existing_root.set('packages', str(current_count + packages_added))
             
-            with gzip.open(existing_filelists, 'wt', encoding='utf-8') as f:
-                existing_tree.write(f, encoding='unicode', xml_declaration=True)
+            # Write merged filelists.xml.gz (lxml handles namespaces correctly)
+            with gzip.open(existing_filelists, 'wb') as f:
+                existing_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
         
         # Merge other.xml.gz
         if 'other' in existing_files and 'other' in new_files:
@@ -530,8 +513,37 @@ class YumRepo:
             current_count = int(existing_root.get('packages', '0'))
             existing_root.set('packages', str(current_count + packages_added))
             
-            with gzip.open(existing_other, 'wt', encoding='utf-8') as f:
-                existing_tree.write(f, encoding='unicode', xml_declaration=True)
+            # Write merged other.xml.gz (lxml handles namespaces correctly)
+            with gzip.open(existing_other, 'wb') as f:
+                existing_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
+        
+        # Create SQLite databases from XML files
+        print("Creating SQLite databases...")
+        
+        # Clean up old SQLite database files first
+        for filename in os.listdir(repodata_dir):
+            if filename.endswith('.sqlite') or filename.endswith('.sqlite.bz2'):
+                old_db_path = os.path.join(repodata_dir, filename)
+                try:
+                    os.remove(old_db_path)
+                except OSError:
+                    pass  # Ignore errors if file doesn't exist
+        
+        sqlite_mgr = SQLiteMetadataManager(repodata_dir)
+        
+        metadata_xml_files = {
+            'primary': existing_primary,
+        }
+        if 'filelists' in existing_files:
+            metadata_xml_files['filelists'] = os.path.join(repodata_dir, existing_files['filelists'])
+        if 'other' in existing_files:
+            metadata_xml_files['other'] = os.path.join(repodata_dir, existing_files['other'])
+        
+        # Create and compress databases
+        db_files = sqlite_mgr.create_all_databases(metadata_xml_files)
+        compressed_dbs = {}
+        for db_type, db_path in db_files.items():
+            compressed_dbs[db_type] = sqlite_mgr.compress_sqlite(db_path)
         
         # Update repomd.xml with new checksums and rename files
         repomd_path = os.path.join(repodata_dir, 'repomd.xml')
@@ -545,6 +557,12 @@ class YumRepo:
         
         for data in data_elements:
             data_type = data.get('type')
+            # Skip database files - they're being recreated
+            if data_type and data_type.endswith('_db'):
+                continue
+            # Only process XML metadata files
+            if data_type not in ['primary', 'filelists', 'other']:
+                continue
             if data_type in existing_files:
                 old_filepath = os.path.join(repodata_dir, existing_files[data_type])
                 
@@ -611,25 +629,71 @@ class YumRepo:
                 if timestamp_elem is not None:
                     timestamp_elem.text = str(int(datetime.now().timestamp()))
         
+        # Remove old SQLite database entries before adding new ones
+        for data in list(repomd_root.findall('repo:data', NS)):
+            if data.get('type', '').endswith('_db'):
+                repomd_root.remove(data)
+        
+        # Also check without namespace
+        for data in list(repomd_root.findall('data')):
+            if data.get('type', '').endswith('_db'):
+                repomd_root.remove(data)
+        
+        # Add SQLite database entries to repomd.xml
+        for db_type, db_path in compressed_dbs.items():
+            self._add_database_to_repomd(repomd_root, repodata_dir, db_type, db_path)
+        
         # Update revision
         revision_elem = repomd_root.find('repo:revision', NS)
+        if revision_elem is None:
+            revision_elem = repomd_root.find('revision')
         if revision_elem is not None:
             revision_elem.text = str(int(datetime.now().timestamp()))
         
-        # Write repomd.xml without namespace prefixes (DNF compatibility)
-        import io
-        output = io.BytesIO()
-        repomd_tree.write(output, encoding='utf-8', xml_declaration=True)
-        xml_content = output.getvalue().decode('utf-8')
+        # Write repomd.xml with proper namespaces (lxml handles this correctly)
+        with open(repomd_path, 'wb') as f:
+            repomd_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
+    
+    def _add_database_to_repomd(self, repomd_root, repodata_dir, db_type, db_path):
+        """Add SQLite database entry to repomd.xml"""
+        filename = os.path.basename(db_path)
+        checksum = self.calculate_checksum(db_path)
+        size = os.path.getsize(db_path)
+        timestamp = int(datetime.now().timestamp())
         
-        # Remove namespace prefixes from repomd.xml only
-        xml_content = re.sub(r'<repo:', '<', xml_content)
-        xml_content = re.sub(r'</repo:', '</', xml_content)
-        xml_content = re.sub(r' xmlns:repo="[^"]*"', '', xml_content)
-        xml_content = re.sub(r' xmlns:rpm="[^"]*"', '', xml_content)
+        # Calculate checksum of uncompressed database
+        with bz2.open(db_path, 'rb') as f:
+            uncompressed_data = f.read()
+            open_checksum = hashlib.sha256(uncompressed_data).hexdigest()
+            open_size = len(uncompressed_data)
         
-        with open(repomd_path, 'w', encoding='utf-8') as f:
-            f.write(xml_content)
+        # Rename file to match checksum
+        new_filename = f"{checksum}-{db_type}.sqlite.bz2"
+        new_path = os.path.join(repodata_dir, new_filename)
+        os.rename(db_path, new_path)
+        
+        # Create data element
+        data_elem = ET.SubElement(repomd_root, 'data', {'type': db_type})
+        
+        checksum_elem = ET.SubElement(data_elem, 'checksum', {'type': 'sha256'})
+        checksum_elem.text = checksum
+        
+        open_checksum_elem = ET.SubElement(data_elem, 'open-checksum', {'type': 'sha256'})
+        open_checksum_elem.text = open_checksum
+        
+        location_elem = ET.SubElement(data_elem, 'location', {'href': f'repodata/{new_filename}'})
+        
+        timestamp_elem = ET.SubElement(data_elem, 'timestamp')
+        timestamp_elem.text = str(timestamp)
+        
+        size_elem = ET.SubElement(data_elem, 'size')
+        size_elem.text = str(size)
+        
+        open_size_elem = ET.SubElement(data_elem, 'open-size')
+        open_size_elem.text = str(open_size)
+        
+        database_version_elem = ET.SubElement(data_elem, 'database_version')
+        database_version_elem.text = '10'
     
     def _manipulate_metadata(self, repo_dir, packages_to_remove):
         """Directly manipulate YUM metadata to remove packages"""
@@ -760,40 +824,64 @@ class YumRepo:
                 if timestamp_elem is not None:
                     timestamp_elem.text = str(int(datetime.now().timestamp()))
         
+        # Create SQLite databases from updated XML files
+        print("  Creating SQLite databases...")
+        sqlite_mgr = SQLiteMetadataManager(repodata_dir)
+        
+        # Remove old SQLite databases from repomd.xml
+        for data in list(repomd_root.findall('repo:data', NS)):
+            if data.get('type', '').endswith('_db'):
+                repomd_root.remove(data)
+        
+        # Also check without namespace
+        for data in list(repomd_root.findall('data')):
+            if data.get('type', '').endswith('_db'):
+                repomd_root.remove(data)
+        
+        # Build metadata file dict
+        metadata_xml_files = {}
+        if primary_file:
+            metadata_xml_files['primary'] = primary_path
+        if filelists_file:
+            metadata_xml_files['filelists'] = filelists_path
+        if other_file:
+            metadata_xml_files['other'] = other_path
+        
+        # Create and compress databases
+        db_files = sqlite_mgr.create_all_databases(metadata_xml_files)
+        compressed_dbs = {}
+        for db_type, db_path in db_files.items():
+            compressed_dbs[db_type] = sqlite_mgr.compress_sqlite(db_path)
+        
+        # Add SQLite database entries to repomd.xml
+        for db_type, db_path in compressed_dbs.items():
+            self._add_database_to_repomd(repomd_root, repodata_dir, db_type, db_path)
+        
         # Update repomd.xml revision
         revision_elem = repomd_root.find('repo:revision', NS)
+        if revision_elem is None:
+            revision_elem = repomd_root.find('revision')
         if revision_elem is not None:
             revision_elem.text = str(int(datetime.now().timestamp()))
         
-        # Write updated repomd.xml without namespace prefixes (DNF compatibility)
-        import io
-        output = io.BytesIO()
-        repomd_tree.write(output, encoding='utf-8', xml_declaration=True)
-        xml_content = output.getvalue().decode('utf-8')
-        
-        # Remove namespace prefixes from repomd.xml only
-        xml_content = re.sub(r'<repo:', '<', xml_content)
-        xml_content = re.sub(r'</repo:', '</', xml_content)
-        xml_content = re.sub(r' xmlns:repo="[^"]*"', '', xml_content)
-        xml_content = re.sub(r' xmlns:rpm="[^"]*"', '', xml_content)
-        
-        with open(repomd_path, 'w', encoding='utf-8') as f:
-            f.write(xml_content)
+        # Write updated repomd.xml with proper namespaces (lxml handles this correctly)
+        with open(repomd_path, 'wb') as f:
+            repomd_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
         
 
     
-    def _validate_quick(self, s3_prefix):
+    def _validate_quick(self, repo_path):
         """
         Quick validation: verify checksums in repomd.xml match actual files
+        and check that RPMs are listed in metadata
         
         Returns:
             bool: True if validation passed
         """
         try:
             # Download repomd.xml
-            repomd_key = f"{s3_prefix}/repodata/repomd.xml"
-            repomd_obj = self.s3_client.get_object(Bucket=self.s3_bucket_name, Key=repomd_key)
-            repomd_content = repomd_obj['Body'].read()
+            repomd_path = f"{repo_path}/repodata/repomd.xml"
+            repomd_content = self.storage.download_file_content(repomd_path)
             
             # Parse repomd.xml
             root = ET.fromstring(repomd_content)
@@ -806,6 +894,18 @@ class YumRepo:
                 NS = {'repo': 'http://linux.duke.edu/metadata/repo'}
                 data_elements = root.findall('repo:data', NS)
             
+            # Check for duplicate data types
+            data_types = {}
+            for data in data_elements:
+                data_type = data.get('type')
+                if data_type:
+                    data_types[data_type] = data_types.get(data_type, 0) + 1
+            
+            for data_type, count in data_types.items():
+                if count > 1:
+                    issues.append(f"Duplicate metadata type '{data_type}' found {count} times in repomd.xml")
+            
+            primary_location = None
             for data in data_elements:
                 data_type = data.get('type')
                 
@@ -830,12 +930,15 @@ class YumRepo:
                     continue
                 
                 file_path = location_elem.get('href').replace('repodata/', '')
-                file_key = f"{s3_prefix}/repodata/{file_path}"
+                file_key = f"{repo_path}/repodata/{file_path}"
+                
+                # Save primary location for later check
+                if data_type == 'primary':
+                    primary_location = file_key
                 
                 # Download and calculate checksum
                 try:
-                    file_obj = self.s3_client.get_object(Bucket=self.s3_bucket_name, Key=file_key)
-                    file_content = file_obj['Body'].read()
+                    file_content = self.storage.download_file_content(file_key)
                     
                     sha256 = hashlib.sha256()
                     sha256.update(file_content)
@@ -846,6 +949,142 @@ class YumRepo:
                 
                 except ClientError as e:
                     issues.append(f"Missing file: {file_key}")
+            
+            # Additional check: verify RPMs are listed in primary.xml
+            if primary_location:
+                try:
+                    # Download and parse primary.xml
+                    primary_content = self.storage.download_file_content(primary_location)
+                    
+                    # Decompress if gzipped
+                    if primary_location.endswith('.gz'):
+                        primary_content = gzip.decompress(primary_content)
+                    
+                    # Parse XML
+                    primary_root = ET.fromstring(primary_content)
+                    
+                    # Get list of packages in metadata
+                    NS = {'common': 'http://linux.duke.edu/metadata/common'}
+                    packages = primary_root.findall('common:package', NS)
+                    if not packages:
+                        packages = primary_root.findall('package')
+                    
+                    metadata_rpms = set()
+                    for package in packages:
+                        location = package.find('common:location', NS)
+                        if location is None:
+                            location = package.find('location')
+                        if location is not None:
+                            href = location.get('href')
+                            filename = os.path.basename(href)
+                            metadata_rpms.add(filename)
+                    
+                    print(f"  Found {len(metadata_rpms)} packages in primary.xml")
+                    if len(metadata_rpms) <= 10:
+                        for rpm in sorted(metadata_rpms):
+                            print(f"    - {rpm}")
+                    
+                    # Get list of RPMs in storage
+                    rpms = set(self.storage.list_files(repo_path, suffix='.rpm'))
+                    
+                    # Check for RPMs in storage but not in metadata
+                    orphaned = rpms - metadata_rpms
+                    if orphaned:
+                        for rpm in sorted(orphaned):
+                            issues.append(f"RPM in storage but not in metadata: {rpm}")
+                    
+                    # Check for RPMs in metadata but not in storage
+                    missing = metadata_rpms - rpms
+                    if missing:
+                        for rpm in sorted(missing):
+                            issues.append(f"RPM in metadata but not in storage: {rpm}")
+                    
+                    # CRITICAL: Validate SQLite databases
+                    print("  Checking SQLite databases...")
+                    primary_db_file = None
+                    for data in data_elements:
+                        if data.get('type') == 'primary_db':
+                            location = data.find('location')
+                            if location is None:
+                                NS_REPO = {'repo': 'http://linux.duke.edu/metadata/repo'}
+                                location = data.find('repo:location', NS_REPO)
+                            if location is not None:
+                                primary_db_file = location.get('href').replace('repodata/', '')
+                                break
+                    
+                    if primary_db_file:
+                        try:
+                            import tempfile
+                            import sqlite3
+                            import bz2
+                            
+                            # Download primary_db
+                            db_path = f"{repo_path}/repodata/{primary_db_file}"
+                            db_compressed = self.storage.download_file_content(db_path)
+                            
+                            # Decompress
+                            db_data = bz2.decompress(db_compressed)
+                            
+                            # Write to temp file and query
+                            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                                tmp.write(db_data)
+                                tmp_path = tmp.name
+                            
+                            try:
+                                conn = sqlite3.connect(tmp_path)
+                                cursor = conn.cursor()
+                                
+                                # Count packages in database
+                                cursor.execute("SELECT COUNT(*) FROM packages")
+                                db_count = cursor.fetchone()[0]
+                                
+                                # Get package names
+                                cursor.execute("SELECT name FROM packages")
+                                db_packages = set([row[0] for row in cursor.fetchall()])
+                                
+                                conn.close()
+                                
+                                print(f"  Found {db_count} packages in primary_db.sqlite")
+                                if db_count <= 10:
+                                    for pkg in sorted(db_packages):
+                                        print(f"    - {pkg}")
+                                
+                                # Compare XML vs SQLite
+                                xml_package_names = set()
+                                for package in packages:
+                                    name_elem = package.find('common:name', NS)
+                                    if name_elem is None:
+                                        name_elem = package.find('name')
+                                    if name_elem is not None:
+                                        xml_package_names.add(name_elem.text)
+                                
+                                if xml_package_names != db_packages:
+                                    issues.append(f"SQLite database mismatch: XML has {len(xml_package_names)} packages, SQLite has {db_count}")
+                                    missing_in_db = xml_package_names - db_packages
+                                    if missing_in_db:
+                                        for pkg in sorted(missing_in_db)[:5]:  # Limit to first 5
+                                            issues.append(f"Package in XML but not in SQLite: {pkg}")
+                                        if len(missing_in_db) > 5:
+                                            issues.append(f"... and {len(missing_in_db) - 5} more packages missing in SQLite")
+                                    extra_in_db = db_packages - xml_package_names
+                                    if extra_in_db:
+                                        for pkg in sorted(extra_in_db)[:5]:  # Limit to first 5
+                                            issues.append(f"Package in SQLite but not in XML: {pkg}")
+                                        if len(extra_in_db) > 5:
+                                            issues.append(f"... and {len(extra_in_db) - 5} more extra packages in SQLite")
+                                else:
+                                    print(f"  ✓ SQLite database matches XML ({db_count} packages)")
+                                
+                            finally:
+                                os.unlink(tmp_path)
+                        
+                        except Exception as e:
+                            issues.append(f"Failed to validate SQLite database: {e}")
+                    else:
+                        issues.append("No primary_db found in metadata (DNF will be slow)")
+                    
+                except Exception as e:
+                    issues.append(f"Failed to validate RPM consistency: {e}")
             
             if issues:
                 for issue in issues:
@@ -858,7 +1097,7 @@ class YumRepo:
             print(Colors.error(f"  ✗ Validation error: {e}"))
             return False
     
-    def _validate_full(self, repo_dir, s3_prefix):
+    def _validate_full(self, repo_dir, repo_path):
         """
         Full validation: checksums, consistency, and client compatibility
         
@@ -940,8 +1179,8 @@ class YumRepo:
         print()
         print(Colors.bold("2. Checking repository consistency..."))
         
-        # Get list of RPMs from S3
-        s3_rpms = set(self._s3_list_objects(s3_prefix, suffix='.rpm'))
+        # Get list of RPMs from storage
+        rpms = set(self.storage.list_files(repo_path, suffix='.rpm'))
         
         # Parse primary.xml to get packages in metadata
         primary_file = metadata_files.get('primary', {}).get('filename')
@@ -971,13 +1210,13 @@ class YumRepo:
                         metadata_rpms.add(filename)
                 
                 # Check for orphaned RPMs (in S3 but not in metadata)
-                orphaned = s3_rpms - metadata_rpms
+                orphaned = rpms - metadata_rpms
                 if orphaned:
                     for rpm in sorted(orphaned):
                         warnings.append(f"Orphaned RPM in S3: {rpm}")
                 
                 # Check for missing RPMs (in metadata but not in S3)
-                missing = metadata_rpms - s3_rpms
+                missing = metadata_rpms - rpms
                 if missing:
                     for rpm in sorted(missing):
                         issues.append(f"Missing RPM from S3: {rpm}")
@@ -1002,9 +1241,77 @@ class YumRepo:
             print(Colors.success("  ✓ Repository consistency OK"))
         
         print()
+        print(Colors.bold("3. Checking SQLite databases..."))
+        
+        # Check for SQLite database files
+        db_types = ['primary_db', 'filelists_db', 'other_db']
+        db_found = []
+        db_missing = []
+        
+        for db_type in db_types:
+            if db_type in metadata_files:
+                db_found.append(db_type)
+                db_file = metadata_files[db_type]['filename']
+                db_path = os.path.join(repo_dir, 'repodata', db_file)
+                
+                # Verify database can be opened
+                try:
+                    # Decompress and check
+                    with bz2.open(db_path, 'rb') as f:
+                        db_data = f.read()
+                    
+                    # Try to open as SQLite
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                        tmp.write(db_data)
+                        tmp_path = tmp.name
+                    
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(tmp_path)
+                        cursor = conn.cursor()
+                        
+                        # Check db_info table exists
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='db_info'")
+                        if not cursor.fetchone():
+                            issues.append(f"{db_type}: missing db_info table")
+                        
+                        # Check packages table exists
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='packages'")
+                        if not cursor.fetchone():
+                            issues.append(f"{db_type}: missing packages table")
+                        else:
+                            # Count packages in database
+                            cursor.execute("SELECT COUNT(*) FROM packages")
+                            db_count = cursor.fetchone()[0]
+                            
+                            # Compare with XML count
+                            if primary_file and db_type == 'primary_db':
+                                if db_count != actual_count:
+                                    issues.append(f"{db_type}: package count mismatch (DB: {db_count}, XML: {actual_count})")
+                        
+                        conn.close()
+                    finally:
+                        os.unlink(tmp_path)
+                    
+                except Exception as e:
+                    issues.append(f"{db_type}: failed to validate - {e}")
+            else:
+                db_missing.append(db_type)
+        
+        if db_found:
+            print(Colors.success(f"  ✓ Found {len(db_found)} SQLite database(s): {', '.join(db_found)}"))
+        
+        if db_missing:
+            warnings.append(f"Missing SQLite databases: {', '.join(db_missing)}")
+            print(Colors.warning(f"  ⚠ Missing: {', '.join(db_missing)}"))
+        
+        print()
         print(Colors.bold("Summary:"))
         if issues:
             print(Colors.error(f"  ✗ {len(issues)} error(s) found"))
+            for issue in issues:
+                print(Colors.error(f"    • {issue}"))
             return False
         elif warnings:
             print(Colors.warning(f"  ⚠ {len(warnings)} warning(s) found"))
@@ -1014,29 +1321,24 @@ class YumRepo:
             print(Colors.success("  ✓ All checks passed"))
             return True
     
-    def _backup_metadata(self, repo_dir, s3_prefix):
+    def _backup_metadata(self, repo_dir, repo_path):
         """Create a backup of metadata in S3 before making changes"""
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        backup_prefix = f"{s3_prefix}/repodata.backup-{timestamp}"
+        backup_prefix = f"{repo_path}/repodata.backup-{timestamp}"
         
-        # Copy all repodata files to backup location in S3
-        repodata_files = self._s3_list_objects(f"{s3_prefix}/repodata")
+        # Copy all repodata files to backup location
+        repodata_files = self.storage.list_files(f"{repo_path}/repodata")
         
         for filename in repodata_files:
-            source_key = f"{s3_prefix}/repodata/{filename}"
-            dest_key = f"{backup_prefix}/{filename}"
-            
-            self.s3_client.copy_object(
-                Bucket=self.s3_bucket_name,
-                CopySource={'Bucket': self.s3_bucket_name, 'Key': source_key},
-                Key=dest_key
-            )
+            source_path = f"{repo_path}/repodata/{filename}"
+            dest_path = f"{backup_prefix}/{filename}"
+            self.storage.copy_file(source_path, dest_path)
         
         # Store backup location for potential restoration
         self.backup_metadata = backup_prefix
-        print(f"  Backup created: s3://{self.s3_bucket_name}/{backup_prefix}")
+        print(f"  Backup created: {self.storage.get_url()}/{backup_prefix}")
     
-    def _restore_metadata(self, s3_prefix):
+    def _restore_metadata(self, repo_path):
         """Restore metadata from backup after a failed operation"""
         if not self.backup_metadata:
             print(Colors.error("  No backup available to restore"))
@@ -1044,33 +1346,25 @@ class YumRepo:
         
         try:
             # Delete current (corrupted) metadata
-            current_files = self._s3_list_objects(f"{s3_prefix}/repodata")
+            current_files = self.storage.list_files(f"{repo_path}/repodata")
             for filename in current_files:
-                self.s3_client.delete_object(
-                    Bucket=self.s3_bucket_name,
-                    Key=f"{s3_prefix}/repodata/{filename}"
-                )
+                self.storage.delete_file(f"{repo_path}/repodata/{filename}")
             
             # Restore from backup
-            backup_files = self._s3_list_objects(self.backup_metadata)
+            backup_files = self.storage.list_files(self.backup_metadata)
             for filename in backup_files:
-                source_key = f"{self.backup_metadata}/{filename}"
-                dest_key = f"{s3_prefix}/repodata/{filename}"
-                
-                self.s3_client.copy_object(
-                    Bucket=self.s3_bucket_name,
-                    CopySource={'Bucket': self.s3_bucket_name, 'Key': source_key},
-                    Key=dest_key
-                )
+                source_path = f"{self.backup_metadata}/{filename}"
+                dest_path = f"{repo_path}/repodata/{filename}"
+                self.storage.copy_file(source_path, dest_path)
             
             print(Colors.success("  ✓ Metadata restored from backup"))
             
             # Keep backup for manual inspection
-            print(Colors.info(f"  Backup retained at: s3://{self.s3_bucket_name}/{self.backup_metadata}"))
+            print(Colors.info(f"  Backup retained at: {self.storage.get_url()}/{self.backup_metadata}"))
             
         except Exception as e:
             print(Colors.error(f"  ✗ Failed to restore backup: {e}"))
-            print(Colors.warning(f"  Manual restoration required from: s3://{self.s3_bucket_name}/{self.backup_metadata}"))
+            print(Colors.warning(f"  Manual restoration required from: {self.storage.get_url()}/{self.backup_metadata}"))
     
     def _cleanup_backup(self):
         """Remove backup after successful operation"""
@@ -1079,68 +1373,18 @@ class YumRepo:
         
         try:
             # Delete backup files
-            backup_files = self._s3_list_objects(self.backup_metadata)
+            backup_files = self.storage.list_files(self.backup_metadata)
             for filename in backup_files:
-                self.s3_client.delete_object(
-                    Bucket=self.s3_bucket_name,
-                    Key=f"{self.backup_metadata}/{filename}"
-                )
+                self.storage.delete_file(f"{self.backup_metadata}/{filename}")
             
             self.backup_metadata = None
             
         except Exception as e:
             # Non-fatal - backup cleanup failure shouldn't stop the operation
             print(Colors.warning(f"  ⚠ Failed to clean up backup: {e}"))
-            print(Colors.info(f"  Backup retained at: s3://{self.s3_bucket_name}/{self.backup_metadata}"))
+            print(Colors.info(f"  Backup retained at: {self.storage.get_url()}/{self.backup_metadata}"))
     
-    def _s3_sync_from_s3(self, s3_prefix, local_dir):
-        """Sync files from S3 to local directory"""
-        os.makedirs(local_dir, exist_ok=True)
-        
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=self.s3_bucket_name, Prefix=s3_prefix):
-            if 'Contents' not in page:
-                continue
-            
-            for obj in page['Contents']:
-                key = obj['Key']
-                # Calculate relative path
-                rel_path = key[len(s3_prefix):].lstrip('/')
-                if not rel_path:
-                    continue
-                
-                local_file = os.path.join(local_dir, rel_path)
-                os.makedirs(os.path.dirname(local_file), exist_ok=True)
-                
-                self.s3_client.download_file(self.s3_bucket_name, key, local_file)
-    
-    def _s3_sync_to_s3(self, local_dir, s3_prefix):
-        """Sync files from local directory to S3"""
-        for root, dirs, files in os.walk(local_dir):
-            for filename in files:
-                local_path = os.path.join(root, filename)
-                relative_path = os.path.relpath(local_path, local_dir)
-                s3_key = f"{s3_prefix}/{relative_path}".replace('\\', '/')
-                
-                self.s3_client.upload_file(local_path, self.s3_bucket_name, s3_key)
-    
-    def _s3_list_objects(self, prefix, suffix=None):
-        """List objects in S3 with optional suffix filter"""
-        objects = []
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-        
-        for page in paginator.paginate(Bucket=self.s3_bucket_name, Prefix=prefix):
-            if 'Contents' not in page:
-                continue
-            
-            for obj in page['Contents']:
-                key = obj['Key']
-                basename = os.path.basename(key)
-                if suffix is None or basename.endswith(suffix):
-                    objects.append(basename)
-        
-        return objects
-    
+
     @staticmethod
     def calculate_checksum(filepath):
         """Calculate SHA256 checksum of a file"""
@@ -1151,69 +1395,185 @@ class YumRepo:
         return sha256.hexdigest()
 
 
+
+
+
+def config_command(args):
+    """Handle config subcommand"""
+    # Determine config file location
+    if args.file:
+        config_file = args.file
+    elif args.system:
+        config_file = '/etc/yums3.conf'
+    elif args.local:
+        config_file = './yums3.conf'
+    else:  # --global or default
+        config_file = os.path.expanduser('~/.yums3.conf')
+    
+    # Load config
+    config = YumConfig(config_file)
+    
+    # Handle different operations
+    if args.list:
+        # List all config values
+        for key, value in sorted(config.list_all().items()):
+            print(f"{key}={value}")
+        return 0
+    
+    elif args.unset:
+        # Unset a key
+        if config.unset(args.unset):
+            config.save()
+            print(f"Unset {args.unset}")
+        else:
+            print(f"Key not found: {args.unset}")
+            return 1
+        return 0
+    
+    elif args.validate_config:
+        # Validate configuration
+        errors = config.validate()
+        if errors:
+            print("Configuration errors:")
+            for error in errors:
+                print(f"  - {error}")
+            return 1
+        else:
+            print("Configuration is valid")
+        return 0
+    
+    elif args.key:
+        # Get or set a key
+        if args.value:
+            # Set value
+            config.set(args.key, args.value)
+            config.save()
+            print(f"Set {args.key} = {args.value}")
+        else:
+            # Get value
+            value = config.get(args.key)
+            if value is not None:
+                print(value)
+            else:
+                print(f"Key not found: {args.key}")
+                return 1
+        return 0
+    
+    else:
+        # No operation specified, show current config file
+        print(f"Config file: {config.config_file}")
+        print(f"Keys: {len(config.data)}")
+        return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Manage YUM repository in S3',
+        description='Efficient YUM repository manager for S3',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  Add RPMs:       %(prog)s package.rpm
-  Remove RPMs:    %(prog)s --remove package-1.0-1.el9.x86_64.rpm
-  Batch add:      %(prog)s -y pkg1.rpm pkg2.rpm pkg3.rpm
-  Validate repo:  %(prog)s --validate el9/x86_64
-  Skip validation: %(prog)s --no-validate package.rpm
+examples:
+  %(prog)s add package.rpm                          add package to repository
+  %(prog)s add pkg1.rpm pkg2.rpm pkg3.rpm           add multiple packages
+  %(prog)s add --files /tmp/rpmbuild/*.rpm          add packages using glob
+  %(prog)s remove package-1.0-1.el9.x86_64.rpm      remove package
+  %(prog)s validate el9/x86_64                      validate repository
+  %(prog)s config backend.type                      get config value
+  %(prog)s config backend.s3.bucket my-bucket       set config value
+  %(prog)s config --list                            list all config
+
+configuration:
+  Create ~/.yums3.conf or /etc/yums3.conf with dot notation:
+  {
+    "backend.type": "s3",
+    "backend.s3.bucket": "your-bucket-name",
+    "backend.s3.profile": "your-profile",
+    "repo.cache_dir": "/path/to/cache"
+  }
+  
+  For local storage:
+  {
+    "backend.type": "local",
+    "backend.local.path": "/path/to/storage",
+    "repo.cache_dir": "/path/to/cache"
+  }
         """
     )
     
-    parser.add_argument(
-        'rpm_files',
-        nargs='+',
-        help='RPM file(s) to add or remove'
-    )
-    parser.add_argument(
-        '-y', '--yes',
-        action='store_true',
-        help='Skip confirmation prompt (for CI/CD)'
-    )
-    parser.add_argument(
-        '-d', '--repo-dir',
-        help='Custom local repository base directory (default: ~/yum-repo)'
-    )
-    parser.add_argument(
-        '--remove',
-        action='store_true',
-        help='Remove specified RPMs from repository instead of adding'
-    )
-    parser.add_argument(
-        '--validate',
-        action='store_true',
-        help='Validate repository (requires el_version/arch as argument)'
-    )
-    parser.add_argument(
-        '--no-validate',
-        action='store_true',
-        help='Skip post-operation validation'
-    )
+    # Global options
+    parser.add_argument('--config', help='Path to config file')
+    parser.add_argument('-b', '--bucket', help='S3 bucket name (overrides config file)')
+    parser.add_argument('-d', '--cache-dir', help='Custom cache directory (overrides config file)')
+    parser.add_argument('--s3-endpoint-url', help='Custom S3 endpoint URL for S3-compatible services (overrides config file)')
+    parser.add_argument('--profile', help='AWS profile to use (overrides config file and AWS_PROFILE env var)')
+    
+    # Create subparsers for commands
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute', required=True)
+    
+    # Add subcommand
+    add_parser = subparsers.add_parser('add', help='Add packages to repository')
+    add_parser.add_argument('rpm_files', nargs='+', help='RPM file(s) to add')
+    add_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
+    add_parser.add_argument('--no-validate', action='store_true', help='Skip post-operation validation')
+    
+    # Remove subcommand
+    remove_parser = subparsers.add_parser('remove', help='Remove packages from repository')
+    remove_parser.add_argument('rpm_files', nargs='+', help='RPM filename(s) to remove')
+    remove_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
+    remove_parser.add_argument('--no-validate', action='store_true', help='Skip post-operation validation')
+    
+    # Validate subcommand
+    validate_parser = subparsers.add_parser('validate', help='Validate repository')
+    validate_parser.add_argument('repo_path', help='Repository path (e.g., el9/x86_64)')
+    
+    # Config subcommand
+    config_parser = subparsers.add_parser('config', help='Manage configuration')
+    config_parser.add_argument('key', nargs='?', help='Config key (dot notation)')
+    config_parser.add_argument('value', nargs='?', help='Config value (if setting)')
+    config_parser.add_argument('--list', action='store_true', help='List all config values')
+    config_parser.add_argument('--unset', metavar='KEY', help='Remove a config key')
+    config_parser.add_argument('--validate', dest='validate_config', action='store_true', help='Validate configuration')
+    config_parser.add_argument('--file', help='Use specific config file')
+    config_parser.add_argument('--global', dest='global_config', action='store_true', help='Use global config (~/.yums3.conf)')
+    config_parser.add_argument('--local', action='store_true', help='Use local config (./yums3.conf)')
+    config_parser.add_argument('--system', action='store_true', help='Use system config (/etc/yums3.conf)')
     
     args = parser.parse_args()
     
+    # Handle config command
+    if args.command == 'config':
+        return config_command(args)
+    
+    # Load configuration
     try:
-        # Initialize repository manager
-        repo = YumRepo(
-            s3_bucket_name="deepgram-yum-repo",
-            local_repo_base=args.repo_dir,
-            skip_validation=args.no_validate
-        )
+        config = YumConfig(args.config)
         
-        # Handle validation command
-        if args.validate:
-            if len(args.rpm_files) != 1:
-                print(Colors.error("✗ Error: --validate requires exactly one argument: el_version/arch"))
-                print("Example: ./rpm-repo.py --validate el9/x86_64")
-                return 1
-            
+        # Apply CLI argument overrides
+        if args.bucket:
+            config.set('backend.s3.bucket', args.bucket)
+        if args.cache_dir:
+            config.set('repo.cache_dir', args.cache_dir)
+        if args.s3_endpoint_url:
+            config.set('backend.s3.endpoint', args.s3_endpoint_url)
+        if args.profile:
+            config.set('backend.s3.profile', args.profile)
+        if hasattr(args, 'no_validate') and args.no_validate:
+            config.set('validation.enabled', False)
+        
+        # Validate configuration
+        errors = config.validate()
+        if errors:
+            print(Colors.error("Configuration errors:"))
+            for error in errors:
+                print(Colors.error(f"  - {error}"))
+            sys.exit(1)
+        
+        # Initialize repository manager
+        repo = YumRepo(config)
+        
+        # Handle validate command
+        if args.command == 'validate':
             # Parse el_version/arch
-            parts = args.rpm_files[0].split('/')
+            parts = args.repo_path.split('/')
             if len(parts) != 2:
                 print(Colors.error("✗ Error: Invalid format. Use: el_version/arch (e.g., el9/x86_64)"))
                 return 1
@@ -1222,28 +1582,32 @@ Examples:
             success = repo.validate_repository(el_version, arch)
             return 0 if success else 1
         
-        # Get AWS info for confirmation
-        aws_info = repo.get_aws_info()
-        
-        # Determine operation details
-        if args.remove:
+        # Determine operation details based on command
+        if args.command == 'remove':
             rpm_filenames = [os.path.basename(f) for f in args.rpm_files]
             # Detect from first filename
             arch, el_version = repo._detect_from_filename(rpm_filenames[0])
             action = "REMOVE"
-            target = f"s3://{repo.s3_bucket_name}/{el_version}/{arch}"
-        else:
+            target = f"{repo.storage.get_url()}/{el_version}/{arch}"
+        elif args.command == 'add':
             rpm_filenames = args.rpm_files
             # Detect from first RPM
             arch, el_version = repo._detect_from_rpm(args.rpm_files[0])
             action = "ADD"
-            target = f"s3://{repo.s3_bucket_name}/{el_version}/{arch}"
+            target = f"{repo.storage.get_url()}/{el_version}/{arch}"
+        else:
+            print(Colors.error(f"✗ Unknown command: {args.command}"))
+            return 1
         
         # Show confirmation
         print()
         print(Colors.bold("Configuration:"))
-        print(f"  AWS Account:  {aws_info['account']}")
-        print(f"  AWS Region:   {aws_info['region']}")
+        
+        # Get backend info and display it
+        backend_info = repo.storage.get_info()
+        for key, value in backend_info.items():
+            print(f"  {key}:  {value}")
+        
         print(f"  Target:       {target}")
         print(f"  Action:       {Colors.bold(action)}")
         print(f"  Packages:     {len(args.rpm_files)}")
@@ -1259,9 +1623,9 @@ Examples:
                 return 0
         
         # Execute operation
-        if args.remove:
+        if args.command == 'remove':
             repo.remove_packages(rpm_filenames)
-        else:
+        elif args.command == 'add':
             repo.add_packages(args.rpm_files)
         
         return 0
