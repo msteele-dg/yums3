@@ -7,16 +7,16 @@ Author: Michael Steele <michael.steele@deepgram.com>
 Licensed under the MIT License. See LICENSE file for details.
 """
 
-from .backend import StorageBackend, S3StorageBackend, LocalStorageBackend, FileTracker
-from .config import YumConfig, create_storage_backend_from_config
+from .backend import StorageBackend, S3StorageBackend, LocalStorageBackend, FileTracker, create_storage_backend
+from .config import RepoConfig
 
 __all__ = [
     'StorageBackend',
     'S3StorageBackend', 
     'LocalStorageBackend',
     'FileTracker',
-    'YumConfig',
-    'create_storage_backend_from_config'
+    'RepoConfig',
+    'create_storage_backend'
 ]
 
 class Colors:

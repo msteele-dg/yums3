@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from core.backend import LocalStorageBackend
-from core.config import YumConfig
+from core.config import RepoConfig
 from yums3 import YumRepo
 
 
@@ -31,7 +31,7 @@ def create_test_config(storage_path, cache_path):
             'repo.cache_dir': cache_path,
             'validation.enabled': False
         }, f)
-    return YumConfig(config_file)
+    return RepoConfig(config_file)
 
 
 def test_local_storage_init():

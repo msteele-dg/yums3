@@ -646,7 +646,7 @@ yums3/
 │   └── ...
 ├── docs/                    # Documentation
 │   ├── CONFIG_COMMAND_REFERENCE.md
-│   ├── YUMCONFIG_COMPLETE.md
+│   ├── REPOCONFIG_COMPLETE.md
 │   ├── STORAGE_BACKEND_INTEGRATION.md
 │   └── ...
 ├── test_rpms/              # Test RPM packages
@@ -693,12 +693,20 @@ Both XML and SQLite are kept in sync automatically.
 
 ## Documentation
 
-See the `docs/` directory for detailed documentation:
+### Quick Links
 
-- **[CONFIG_COMMAND_REFERENCE.md](docs/CONFIG_COMMAND_REFERENCE.md)** - Complete config command reference
-- **[YUMCONFIG_COMPLETE.md](docs/YUMCONFIG_COMPLETE.md)** - Configuration system documentation
-- **[STORAGE_BACKEND_INTEGRATION.md](docs/STORAGE_BACKEND_INTEGRATION.md)** - Storage backend details
-- **[DOT_NOTATION_CONFIG_DESIGN.md](docs/DOT_NOTATION_CONFIG_DESIGN.md)** - Configuration design
+- **[User Guide](docs/USER_GUIDE.md)** - Complete user documentation
+- **[Configuration Reference](docs/CONFIG_COMMAND_REFERENCE.md)** - Config command guide
+- **[Architecture](docs/ARCHITECTURE.md)** - System design and architecture
+- **[Developer Guide](docs/DEVELOPER_GUIDE.md)** - For contributors
+- **[Documentation Index](docs/INDEX.md)** - Complete documentation index
+
+### Getting Started
+
+1. **New users:** Start with the [User Guide](docs/USER_GUIDE.md)
+2. **Configuration:** See [Configuration Reference](docs/CONFIG_COMMAND_REFERENCE.md)
+3. **Developers:** Read the [Developer Guide](docs/DEVELOPER_GUIDE.md)
+4. **Architecture:** Understand the [Architecture](docs/ARCHITECTURE.md)
 
 ## See Also
 

@@ -11,6 +11,7 @@ import os
 import subprocess
 from abc import ABC, abstractmethod
 from typing import List, Optional
+from .config import RepoConfig
 
 try:
     import boto3
@@ -158,49 +159,74 @@ class StorageBackend(ABC):
         pass
 
 
-def create_storage_backend(config: dict) -> StorageBackend:
+def create_storage_backend(config: RepoConfig, repo_type: str) -> StorageBackend:
     """Create storage backend from configuration"""
-    storage_type = config.get('storage_type', 's3')
+    storage_type = config.get('backend.type', 's3')
     
     if storage_type == 's3':
-        return S3StorageBackend(
-            bucket_name=config['s3_bucket'],
-            aws_profile=config.get('aws_profile'),
-            endpoint_url=config.get('s3_endpoint_url')
-        )
+        return S3StorageBackend(config, repo_type)
     elif storage_type == 'local':
-        return LocalStorageBackend(
-            base_path=config['local_storage_path']
-        )
+        return LocalStorageBackend(config, repo_type)
     else:
         raise ValueError(f"Unknown storage type: {storage_type}")
 
 
 class S3StorageBackend(StorageBackend):
-    """S3-based storage backend"""
-    
-    def __init__(self, bucket_name: str, aws_profile: Optional[str] = None, 
-                 endpoint_url: Optional[str] = None):
+    def __init__(self, config: RepoConfig, repo_type: str):
         """
         Initialize S3 storage backend
-        
-        Args:
-            bucket_name: Name of the S3 bucket
-            aws_profile: AWS profile to use (optional)
-            endpoint_url: Custom S3 endpoint URL (optional, for S3-compatible services)
+                
+        Raises:
+            ValueError: If bucket_name is not provided
+            ImportError: If boto3 is not installed
         """
         if boto3 is None:
             raise ImportError("boto3 is required for S3StorageBackend. Install it with: pip install boto3")
+
+        bucket_name = config.get_for_type('backend.s3.bucket', repo_type)
+        endpoint = config.get_for_type('backend.s3.endpoint', repo_type)
+
+        # Validate required configuration
+        if not bucket_name:
+            raise ValueError(f"backend.{repo_type}.s3.bucket is required for S3StorageBackend and {repo_type} repo")
         
         self.bucket_name = bucket_name
-        self.aws_profile = aws_profile
-        self.endpoint_url = endpoint_url
+        self.endpoint_url = endpoint
+
+        aws_profile = config.get_for_type('backend.s3.profile', repo_type)
+        aws_region = config.get_for_type('backend.s3.region', repo_type)
         
+        # Determine which profile/region to use:
+        # 1. Explicit profile from config (if not 'default')
+        # 2. AWS_PROFILE environment variable (boto3 handles this automatically when profile_name=None)
+        # 3. Default credentials chain (when profile_name=None)
+        if aws_profile and aws_profile != 'default':
+            self.aws_profile = aws_profile
+            self.aws_profile_src = config.config_file
+        elif os.environ.get('AWS_PROFILE'):
+            self.aws_profile = os.environ.get('AWS_PROFILE')
+            self.aws_profile_src = "AWS_PROFILE"
+        else:
+            self.aws_profile = None
+        
+        if aws_region:
+            self.aws_region = aws_region
+            self.aws_region_src = config.config_file
+        elif os.environ.get('AWS_REGION'):
+            self.aws_region = os.environ.get('AWS_REGION')
+            self.aws_region_src = "AWS_REGION"
+        else:
+            self.aws_region = None
+
         # Initialize boto3 client
-        session = boto3.Session(profile_name=aws_profile if aws_profile != 'default' else None)
+        session = boto3.Session(
+            profile_name=self.aws_profile,
+            region_name=self.aws_region
+        )
         s3_config = {}
-        if endpoint_url:
+        if self.endpoint_url:
             s3_config['endpoint_url'] = endpoint_url
+
         self.s3_client = session.client('s3', **s3_config)
     
     def exists(self, path: str) -> bool:
@@ -214,7 +240,11 @@ class S3StorageBackend(StorageBackend):
     def download_file(self, remote_path: str, local_path: str) -> None:
         """Download a file from S3 to local path"""
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        self.s3_client.download_file(self.bucket_name, remote_path, local_path)
+        self.s3_client.download_file(
+            self.bucket_name,
+            remote_path,
+            local_path
+        )
     
     def upload_file(self, local_path: str, remote_path: str) -> None:
         """Upload a file from local path to S3"""
@@ -306,21 +336,8 @@ class S3StorageBackend(StorageBackend):
             info['AWS Account'] = "Unable to determine"
         
         # Get AWS region
-        region = self.s3_client.meta.region_name
-        if region:
-            info['AWS Region'] = region
-        elif os.environ.get('AWS_REGION'):
-            info['AWS Region'] = f"{os.environ['AWS_REGION']} (from AWS_REGION)"
-        elif os.environ.get('AWS_DEFAULT_REGION'):
-            info['AWS Region'] = f"{os.environ['AWS_DEFAULT_REGION']} (from AWS_DEFAULT_REGION)"
-        else:
-            info['AWS Region'] = "Unable to determine"
-        
-        # Get AWS profile
-        if self.aws_profile and self.aws_profile != 'default':
-            info['AWS Profile'] = self.aws_profile
-        else:
-            info['AWS Profile'] = "default"
+        info['AWS Region'] = f"{self.aws_region} (from {self.aws_region_src})"
+        info['AWS Profile'] = f"{self.aws_profile} (from {self.aws_profile_src})"
         
         # Get S3 URL
         info['S3 URL'] = self.get_url()
@@ -331,13 +348,22 @@ class S3StorageBackend(StorageBackend):
 class LocalStorageBackend(StorageBackend):
     """Local filesystem storage backend for testing"""
     
-    def __init__(self, base_path: str):
+    def __init__(self, config: RepoConfig, repo_type: str):
         """
         Initialize local storage backend
         
         Args:
             base_path: Base directory for storage
+        
+        Raises:
+            ValueError: If base_path is not provided or is empty
         """
+        # Validate required configuration
+        base_path = config.get_for_type('backend.local.path', repo_type)
+
+        if not base_path:
+            raise ValueError("base_path is required for LocalStorageBackend")
+        
         self.base_path = os.path.abspath(base_path)
         os.makedirs(self.base_path, exist_ok=True)
     
