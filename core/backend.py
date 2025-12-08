@@ -200,6 +200,7 @@ class S3StorageBackend(StorageBackend):
         # 1. Explicit profile from config (if not 'default')
         # 2. AWS_PROFILE environment variable (boto3 handles this automatically when profile_name=None)
         # 3. Default credentials chain (when profile_name=None)
+        self.aws_profile_src = None
         if aws_profile and aws_profile != 'default':
             self.aws_profile = aws_profile
             self.aws_profile_src = config.config_file
@@ -209,6 +210,7 @@ class S3StorageBackend(StorageBackend):
         else:
             self.aws_profile = None
         
+        self.aws_region_src = None
         if aws_region:
             self.aws_region = aws_region
             self.aws_region_src = config.config_file

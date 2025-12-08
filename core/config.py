@@ -13,8 +13,29 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.constants import (
     AVAIL_BACKEND_TYPES,
     DEFAULTS,
-    REPO_CONFIG_FILES
+    RepoConfigFiles
 )
+
+def load_config(args, repo_type):
+    if 'file' in args and args.file:
+        config_file = args.file
+    elif 'system' in args and args.system:
+        config_file = RepoConfigFiles.SYSTEM
+    elif 'local' in args and args.local:
+        config_file = RepoConfigFiles.LOCAL
+    else:  # --global or default
+        locations = [
+            RepoConfigFiles.LOCAL,
+            RepoConfigFiles.USER,
+            RepoConfigFiles.SYSTEM
+        ]
+        print(locations)
+        for location in locations:
+            if os.path.exists(location.value):
+                config_file = location.value
+
+    return RepoConfig(config_file, repo_type)
+
 
 class RepoConfig:
     """Git-style configuration manager with dot notation
@@ -31,13 +52,14 @@ class RepoConfig:
     # Default values
 
         
-    def __init__(self, config_file: Optional[str] = None):
+    def __init__(self, config_file: str, repo_type: str):
         """Initialize configuration
         
         Args:
             config_file: Path to config file (if None, searches standard locations)
         """
-        self.config_file = config_file or self._find_config_file()
+        self.repo_type = repo_type
+        self.config_file = config_file
         self.data = self._load()
         self.track_defaults = []
 
@@ -193,30 +215,6 @@ class RepoConfig:
                 return json.load(f)
         except (json.JSONDecodeError, IOError) as e:
             raise ValueError(f"Failed to load config from {self.config_file}: {e}")
-
-    def _find_config_file(self) -> str:
-        """Find config file in standard locations
-        
-        Searches in order:
-        1. ./dg-repos.conf (current directory)
-        2. ~/.dg-repos.conf (user home)
-        3. /etc/dg-repos.conf (system-wide)
-        
-        Returns:
-            Path to first existing config file, or ~/.dg-repos.conf as default
-        """
-        locations = [
-            REPO_CONFIG_FILES["local"],
-            REPO_CONFIG_FILES["user"],
-            REPO_CONFIG_FILES["system"]
-        ]
-        
-        for location in locations:
-            if os.path.exists(location):
-                return location
-        
-        # Default to user config
-        return REPO_CONFIG_FILES["user"]
     
     def __repr__(self) -> str:
         """String representation"""
@@ -225,6 +223,6 @@ class RepoConfig:
     def __str__(self) -> str:
         """Human-readable string"""
         lines = [f"Config file: {self.config_file}"]
-        for key, value in sorted(self.list_all().items()):
+        for key, value in sorted(self.data.items()):
             lines.append(f"  {key} = {value}")
         return '\n'.join(lines)
