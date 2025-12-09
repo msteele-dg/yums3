@@ -35,23 +35,12 @@ except ImportError:
 
 def config_command(args):
     """Handle config subcommand"""
-    # Determine config file location
-    if args.file:
-        config_file = args.file
-    elif args.system:
-        config_file = RepoConfigFiles.SYSTEM
-    elif args.local:
-        config_file = RepoConfigFiles.LOCAL
-    else:  # --global or default
-        config_file = RepoConfigFiles.USER
-    
-    # Load config
-    config = RepoConfig(config_file)
+    config = load_config(args, 'yum')
     
     # Handle different operations
     if args.list:
         # List all config values
-        for key, value in sorted(config.list_all().items()):
+        for key, value in sorted(config.data.items()):
             print(f"{key}={value}")
         return 0
     

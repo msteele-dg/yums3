@@ -118,14 +118,6 @@ class RepoConfig:
         """
         return key in self.data
     
-    def list(self) -> Dict[str, Any]:
-        """Get all config key-value pairs including defaults
-        
-        Returns:
-            Dictionary of all config values
-        """
-        return self.data
-    
     def get_section(self, prefix: str) -> Dict[str, Any]:
         """Get all keys under a prefix
         

@@ -1294,21 +1294,32 @@ class YumRepo:
             return True
     
     def _backup_metadata(self, repo_dir, repo_path):
-        """Create a backup of metadata in S3 before making changes"""
+        """Create a backup of metadata from local directory before making changes"""
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         backup_prefix = f"{repo_path}/repodata.backup-{timestamp}"
+        print(timestamp)
+        print(backup_prefix)
         
-        # Copy all repodata files to backup location
-        repodata_files = self.storage.list_files(f"{repo_path}/repodata")
+        # Upload current local repodata to backup location in storage
+        # This ensures we backup exactly what we downloaded, not what might be in S3 now
+        repodata_dir = os.path.join(repo_dir, 'repodata')
+        print(repodata_dir)
+        if not os.path.exists(repodata_dir):
+            print(Colors.warning("  ⚠ No local metadata to backup"))
+            return
         
-        for filename in repodata_files:
-            source_path = f"{repo_path}/repodata/{filename}"
-            dest_path = f"{backup_prefix}/{filename}"
-            self.storage.copy_file(source_path, dest_path)
+        backed_up_count = 0
+        for filename in os.listdir(repodata_dir):
+            print(filename)
+            local_file = os.path.join(repodata_dir, filename)
+            if os.path.isfile(local_file):
+                dest_path = f"{backup_prefix}/{filename}"
+                self.storage.upload_file(local_file, dest_path)
+                backed_up_count += 1
         
         # Store backup location for potential restoration
         self.backup_metadata = backup_prefix
-        print(f"  Backup created: {self.storage.get_url()}/{backup_prefix}")
+        print(f"  Backup created: {self.storage.get_url()}/{backup_prefix} ({backed_up_count} files)")
     
     def _restore_metadata(self, repo_path):
         """Restore metadata from backup after a failed operation"""

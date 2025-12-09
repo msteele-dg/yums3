@@ -58,8 +58,14 @@ class FileTracker:
 
 
 class StorageBackend(ABC):
-    """Abstract base class for storage backends"""
-    
+    def __init__(self, args):
+        if 'debug' in args and args.debug == "True":
+            self.debug = True
+
+    def verbose(self, output):
+        if self.debug:
+            print(f" - [debug] {output}")
+
     @abstractmethod
     def exists(self, path: str) -> bool:
         """Check if a file exists at the given path"""
@@ -230,6 +236,8 @@ class S3StorageBackend(StorageBackend):
             s3_config['endpoint_url'] = endpoint_url
 
         self.s3_client = session.client('s3', **s3_config)
+
+        self.debug = config.get('backend.debug', False)
     
     def exists(self, path: str) -> bool:
         """Check if a file exists in S3"""
@@ -319,6 +327,7 @@ class S3StorageBackend(StorageBackend):
     
     def copy_file(self, src_path: str, dst_path: str) -> None:
         """Copy a file within S3 (uses efficient copy_object)"""
+        self.verbose(f"copy {src_path} -> {dst_path}")
         self.s3_client.copy_object(
             Bucket=self.bucket_name,
             CopySource={'Bucket': self.bucket_name, 'Key': src_path},
