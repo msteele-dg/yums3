@@ -868,8 +868,6 @@ class YumRepo:
         with open(repomd_path, 'wb') as f:
             repomd_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
         
-
-    
     def _validate_quick(self, repo_path):
         """
         Quick validation: verify checksums in repomd.xml match actual files
@@ -1328,7 +1326,7 @@ class YumRepo:
         
         # Copy all repodata files to backup location
         repodata_files = self.storage.list_files(f"{repo_path}/repodata")
-        
+
         for filename in repodata_files:
             source_path = f"{repo_path}/repodata/{filename}"
             dest_path = f"{backup_prefix}/{filename}"
@@ -1384,7 +1382,6 @@ class YumRepo:
             print(Colors.warning(f"  ⚠ Failed to clean up backup: {e}"))
             print(Colors.info(f"  Backup retained at: {self.storage.get_url()}/{self.backup_metadata}"))
     
-
     @staticmethod
     def calculate_checksum(filepath):
         """Calculate SHA256 checksum of a file"""
@@ -1393,9 +1390,6 @@ class YumRepo:
             for chunk in iter(lambda: f.read(4096), b''):
                 sha256.update(chunk)
         return sha256.hexdigest()
-
-
-
 
 
 def config_command(args):
