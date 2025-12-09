@@ -727,8 +727,8 @@ class YumRepo:
         
         # Write updated primary.xml.gz
         new_primary_path = primary_path + '.new'
-        with gzip.open(new_primary_path, 'wt', encoding='utf-8') as f:
-            primary_tree.write(f, encoding='unicode', xml_declaration=True)
+        with gzip.open(new_primary_path, 'wb') as f:
+            primary_tree.write(f, encoding='utf-8', xml_declaration=True)
         os.replace(new_primary_path, primary_path)
         
         # Process filelists.xml.gz
@@ -750,8 +750,8 @@ class YumRepo:
             filelists_root.set('packages', str(current_count - packages_removed))
             
             new_filelists_path = filelists_path + '.new'
-            with gzip.open(new_filelists_path, 'wt', encoding='utf-8') as f:
-                filelists_tree.write(f, encoding='unicode', xml_declaration=True)
+            with gzip.open(new_filelists_path, 'wb') as f:
+                filelists_tree.write(f, encoding='utf-8', xml_declaration=True)
             os.replace(new_filelists_path, filelists_path)
         
         # Process other.xml.gz
@@ -773,8 +773,8 @@ class YumRepo:
             other_root.set('packages', str(current_count - packages_removed))
             
             new_other_path = other_path + '.new'
-            with gzip.open(new_other_path, 'wt', encoding='utf-8') as f:
-                other_tree.write(f, encoding='unicode', xml_declaration=True)
+            with gzip.open(new_other_path, 'wb') as f:
+                other_tree.write(f, encoding='utf-8', xml_declaration=True)
             os.replace(new_other_path, other_path)
         
         # Update repomd.xml with new checksums and timestamps
@@ -1297,20 +1297,16 @@ class YumRepo:
         """Create a backup of metadata from local directory before making changes"""
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         backup_prefix = f"{repo_path}/repodata.backup-{timestamp}"
-        print(timestamp)
-        print(backup_prefix)
         
         # Upload current local repodata to backup location in storage
         # This ensures we backup exactly what we downloaded, not what might be in S3 now
         repodata_dir = os.path.join(repo_dir, 'repodata')
-        print(repodata_dir)
         if not os.path.exists(repodata_dir):
             print(Colors.warning("  ⚠ No local metadata to backup"))
             return
         
         backed_up_count = 0
         for filename in os.listdir(repodata_dir):
-            print(filename)
             local_file = os.path.join(repodata_dir, filename)
             if os.path.isfile(local_file):
                 dest_path = f"{backup_prefix}/{filename}"

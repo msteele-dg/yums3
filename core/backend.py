@@ -327,7 +327,6 @@ class S3StorageBackend(StorageBackend):
     
     def copy_file(self, src_path: str, dst_path: str) -> None:
         """Copy a file within S3 (uses efficient copy_object)"""
-        self.verbose(f"copy {src_path} -> {dst_path}")
         self.s3_client.copy_object(
             Bucket=self.bucket_name,
             CopySource={'Bucket': self.bucket_name, 'Key': src_path},
