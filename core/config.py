@@ -37,6 +37,63 @@ def load_config(args, repo_type):
     return RepoConfig(config_file, repo_type)
 
 
+def config_command(args):
+    """Handle config subcommand"""
+    config = load_config(args, 'yum')
+    
+    # Handle different operations
+    if args.list:
+        # List all config values
+        for key, value in sorted(config.data.items()):
+            print(f"{key}={value}")
+        return 0
+    
+    elif args.unset:
+        # Unset a key
+        if config.unset(args.unset):
+            config.save()
+            print(f"Unset {args.unset}")
+        else:
+            print(f"Key not found: {args.unset}")
+            return 1
+        return 0
+    
+    elif args.validate_config:
+        # Validate configuration
+        errors = config.validate()
+        if errors:
+            print("Configuration errors:")
+            for error in errors:
+                print(f"  - {error}")
+            return 1
+        else:
+            print("Configuration is valid")
+        return 0
+    
+    elif args.key:
+        # Get or set a key
+        if args.value:
+            # Set value
+            config.set(args.key, args.value)
+            config.save()
+            print(f"Set {args.key} = {args.value}")
+        else:
+            # Get value
+            value = config.get(args.key)
+            if value is not None:
+                print(value)
+            else:
+                print(f"Key not found: {args.key}")
+                return 1
+        return 0
+    
+    else:
+        # No operation specified, show current config file
+        print(f"Config file: {config.config_file}")
+        print(f"Keys: {len(config.data)}")
+        return 0
+
+
 class RepoConfig:
     """Git-style configuration manager with dot notation
     

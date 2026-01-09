@@ -11,18 +11,9 @@ Licensed under the MIT License. See LICENSE file for details.
 import argparse
 import os
 import sys
-import subprocess
 import re
-import gzip
-import hashlib
-from datetime import datetime
-from pathlib import Path
-import json
-import bz2
 
-from core.backend import create_storage_backend
-from core.config import load_config
-from core.sqlite_metadata import SQLiteMetadataManager
+from core.config import load_config, config_command
 from core.yum import YumRepo
 from core import Colors
 
@@ -31,63 +22,6 @@ try:
 except ImportError:
     print("ERROR: lxml is not installed. Install it with: pip install lxml")
     sys.exit(1)
-
-
-def config_command(args):
-    """Handle config subcommand"""
-    config = load_config(args, 'yum')
-    
-    # Handle different operations
-    if args.list:
-        # List all config values
-        for key, value in sorted(config.data.items()):
-            print(f"{key}={value}")
-        return 0
-    
-    elif args.unset:
-        # Unset a key
-        if config.unset(args.unset):
-            config.save()
-            print(f"Unset {args.unset}")
-        else:
-            print(f"Key not found: {args.unset}")
-            return 1
-        return 0
-    
-    elif args.validate_config:
-        # Validate configuration
-        errors = config.validate()
-        if errors:
-            print("Configuration errors:")
-            for error in errors:
-                print(f"  - {error}")
-            return 1
-        else:
-            print("Configuration is valid")
-        return 0
-    
-    elif args.key:
-        # Get or set a key
-        if args.value:
-            # Set value
-            config.set(args.key, args.value)
-            config.save()
-            print(f"Set {args.key} = {args.value}")
-        else:
-            # Get value
-            value = config.get(args.key)
-            if value is not None:
-                print(value)
-            else:
-                print(f"Key not found: {args.key}")
-                return 1
-        return 0
-    
-    else:
-        # No operation specified, show current config file
-        print(f"Config file: {config.config_file}")
-        print(f"Keys: {len(config.data)}")
-        return 0
 
 
 def main():
