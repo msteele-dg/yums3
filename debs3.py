@@ -57,18 +57,12 @@ def main():
     validate_parser.add_argument('architecture', help='Architecture (e.g., amd64)')
 
     replicate_parser = subparsers.add_parser('replicate', help="Replicate packages between distributions")
+    replicate_parser.add_argument('package_names', nargs='+', help='Package name(s) or package_version to replicate')
     replicate_parser.add_argument('--src', required=True, help='Source distribution (e.g., focal)')
     replicate_parser.add_argument('--dst', required=True, help='Destination distribution (e.g., noble)')
     replicate_parser.add_argument('--component', help='Component (defaults to config)', default=None)
     replicate_parser.add_argument('--arch', help='Architecture (defaults to config architectures)', default=None)
-
-    args = p.parse_args()
-
-    config_path = choose_config(args.config)
-    config = RepoConfig(config_path, 'deb')
-    repo = DebRepo(config)
-
-    repo.replicate_distribution(args.src, args.dst, component=args.component, arch=args.arch)
+    replicate_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
 
 
     # Config subcommand
@@ -114,11 +108,44 @@ def main():
         if args.command == 'validate':
             success = repo.validate_repository(args.distribution, args.component, args.architecture)
             return 0 if success else 1
-        
+
+        # Handle replicate command
+        if args.command == 'replicate':
+            print()
+            print(Colors.bold("Configuration:"))
+
+            backend_info = repo.storage.get_info()
+            for key, value in backend_info.items():
+                print(f"  {key:<11}: {value}")
+
+            print(f"  Action:       {Colors.bold('REPLICATE')}")
+            print(f"  Source:       {args.src}")
+            print(f"  Destination:  {args.dst}")
+            print(f"  Packages:     {len(args.package_names)}")
+            for pkg in args.package_names:
+                print(f"    • {pkg}")
+            print()
+
+            # Confirm operation
+            if not args.yes:
+                response = input(Colors.bold("Continue? (yes/no): "))
+                if response.lower() != "yes":
+                    print(Colors.warning("Cancelled"))
+                    return 0
+
+            repo.replicate_distribution(
+                args.src,
+                args.dst,
+                args.package_names,
+                component=args.component,
+                arch=args.arch
+            )
+            return 0
+
         # Get backend info and show confirmation
         print()
         print(Colors.bold("Configuration:"))
-        
+
         backend_info = repo.storage.get_info()
         for key, value in backend_info.items():
             print(f"  {key:<11}: {value}")

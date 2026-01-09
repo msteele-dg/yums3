@@ -29,7 +29,7 @@ def load_config(args, repo_type):
             RepoConfigFiles.USER,
             RepoConfigFiles.SYSTEM
         ]
-        print(locations)
+
         for location in locations:
             if os.path.exists(location.value):
                 config_file = location.value

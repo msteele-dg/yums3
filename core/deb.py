@@ -949,7 +949,7 @@ class DebRepo:
     def _generate_release_file(self, distribution, local_dir):
         """
         Generate Release file for distribution
-        
+
         Args:
             distribution: Distribution name
             local_dir: Local directory containing Packages files (binary-arch directory)
@@ -958,34 +958,45 @@ class DebRepo:
         # local_dir is cache_dir/distribution/component/binary-arch
         # We need to walk from cache_dir/distribution to find all Packages files
         dist_dir = os.path.dirname(os.path.dirname(local_dir))  # Go up to distribution level
-        
+
         packages_files = []
+        architectures_found = set()
+
         for root, dirs, files in os.walk(dist_dir):
             for file in files:
                 if file.startswith('Packages'):
                     packages_files.append(os.path.join(root, file))
-        
+                    # Extract architecture from path: component/binary-ARCH/Packages
+                    # root is like: cache_dir/distribution/component/binary-amd64
+                    dir_name = os.path.basename(root)
+                    if dir_name.startswith('binary-'):
+                        arch = dir_name.replace('binary-', '')
+                        architectures_found.add(arch)
+
         # Calculate checksums
         md5sums = []
         sha1sums = []
         sha256sums = []
-        
+
         for pkg_file in packages_files:
             # Get relative path from distribution directory
             relative_path = os.path.relpath(pkg_file, dist_dir)
             size = os.path.getsize(pkg_file)
-            
+
             md5sums.append(f" {self._calculate_md5(pkg_file)} {size:8d} {relative_path}")
             sha1sums.append(f" {self._calculate_sha1(pkg_file)} {size:8d} {relative_path}")
             sha256sums.append(f" {self._calculate_sha256(pkg_file)} {size:8d} {relative_path}")
-        
+
+        # Use detected architectures if any found, otherwise fall back to configured
+        architectures = sorted(architectures_found) if architectures_found else self.architectures
+
         # Build Release file
         release_content = f"""Origin: {self.origin}
 Label: {self.label}
 Suite: {distribution}
 Codename: {distribution}
 Date: {datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S UTC')}
-Architectures: {' '.join(self.architectures)}
+Architectures: {' '.join(architectures)}
 Components: {self.default_component}
 Description: {self.origin} Debian Repository
 MD5Sum:
@@ -995,7 +1006,7 @@ SHA1:
 SHA256:
 {chr(10).join(sha256sums)}
 """
-        
+
         # Write Release file at distribution level
         release_file = os.path.join(dist_dir, 'Release')
         with open(release_file, 'w') as f:
@@ -1120,99 +1131,202 @@ SHA256:
             print(Colors.warning(f"  ⚠ Failed to clean up backup: {e}"))
             print(Colors.info(f"  Backup retained at: {self.storage.get_url()}/{self.backup_path}"))
 
-    def replicate_distribution(self, src_distribution, dst_distribution, component=None, arch=None):
+    def replicate_distribution(self, src_distribution, dst_distribution, package_names, component=None, arch=None):
         """
-        Replicate packages metadata from one distribution to another.
+        Replicate specific packages from one distribution to another.
 
         Args:
             src_distribution: Source distribution name (e.g., 'focal')
             dst_distribution: Destination distribution name (e.g., 'noble')
+            package_names: List of package names or package_version strings to replicate
             component: Component name (defaults to repo default)
             arch: Architecture name (if None, will iterate configured architectures)
         """
         component = component or self.default_component
         archs = [arch] if arch else self.architectures
 
-        print(Colors.info(f"Replicating {src_distribution} → {dst_distribution} for {component} ({', '.join(archs)})"))
+        print(Colors.info(f"Replicating packages from {src_distribution} → {dst_distribution}"))
+        print(Colors.info(f"Target: {component} ({', '.join(archs)})"))
+        print(Colors.info(f"Packages: {', '.join(package_names)}"))
 
         # Ensure destination structure may be backed up if exists
         # Create backup of destination metadata if it exists
-        if self._repo_exists(dst_distribution, component, archs[0]):
-            try:
-                self._backup_metadata(dst_distribution, component, archs[0])
-            except Exception:
-                pass
-
         for a in archs:
-            src_packages = f"dists/{src_distribution}/{component}/binary-{a}/Packages"
-            for suffix in ['', '.gz', '.bz2']:
-                src_path = src_packages + suffix
-                dst_path = f"dists/{dst_distribution}/{component}/binary-{a}/Packages" + suffix
-
-                if self.storage.exists(src_path):
-                    try:
-                        # Copy Packages files directly within storage
-                        self.storage.copy_file(src_path, dst_path)
-                        print(f"  • Copied {src_path} → {dst_path}")
-                    except Exception as e:
-                        print(Colors.warning(f"  ⚠ Could not copy {src_path}: {e}"))
-                else:
-                    print(Colors.info(f"  - Source metadata missing: {src_path} (skipping)"))
-
-            # After copying Packages, check for referenced pool files and warn if missing
-            try:
-                packages_content = self.storage.download_file_content(src_packages).decode('utf-8')
-                for line in packages_content.split('\n'):
-                    if line.startswith('Filename:'):
-                        filename = line.split(':', 1)[1].strip()
-                        if not self.storage.exists(filename):
-                            print(Colors.warning(f"  ⚠ Referenced pool file missing: {filename}"))
-            except Exception:
-                # Not fatal; continue
-                pass
-
-        # Copy and adjust Release file
-        src_release_path = f"dists/{src_distribution}/Release"
-        dst_release_path = f"dists/{dst_distribution}/Release"
-
-        if self.storage.exists(src_release_path):
-            try:
-                release_bytes = self.storage.download_file_content(src_release_path)
-                release_text = release_bytes.decode('utf-8')
-
-                # Replace Suite and Codename lines with destination
-                new_lines = []
-                for line in release_text.split('\n'):
-                    if line.startswith('Suite:'):
-                        new_lines.append(f"Suite: {dst_distribution}")
-                    elif line.startswith('Codename:'):
-                        new_lines.append(f"Codename: {dst_distribution}")
-                    else:
-                        new_lines.append(line)
-
-                # Update Date to now (UTC)
-                from datetime import datetime
-                updated = '\n'.join(new_lines)
-                updated = re.sub(r"Date: .*", f"Date: {datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S UTC')}", updated)
-
-                # Write to temp file and upload
-                with tempfile.NamedTemporaryFile('w', delete=False) as tf:
-                    tf.write(updated)
-                    tmpname = tf.name
-
-                self.storage.upload_file(tmpname, dst_release_path)
+            if self._repo_exists(dst_distribution, component, a):
                 try:
-                    os.unlink(tmpname)
+                    self._backup_metadata(dst_distribution, component, a)
+                    break  # Only need one backup per operation
                 except Exception:
                     pass
 
-                print(f"  • Created {dst_release_path}")
-            except Exception as e:
-                print(Colors.warning(f"  ⚠ Could not replicate Release file: {e}"))
-        else:
-            print(Colors.info(f"  - Source Release missing: {src_release_path} (skipping)"))
+        for a in archs:
+            src_packages_path = f"dists/{src_distribution}/{component}/binary-{a}/Packages"
 
-        print(Colors.success(f"✓ Replication complete: {self.storage.get_url()}/{dst_distribution}/{component}"))
+            if not self.storage.exists(src_packages_path):
+                print(Colors.warning(f"  ⚠ Source metadata missing: {src_packages_path} (skipping {a})"))
+                continue
+
+            print(f"\nProcessing architecture: {a}")
+
+            # Download source Packages file
+            print("  Downloading source metadata...")
+            src_packages_content = self.storage.download_file_content(src_packages_path).decode('utf-8')
+
+            # Parse source packages and filter by package_names
+            print("  Filtering packages...")
+            selected_entries = []
+            replicated_packages = []
+            missing_packages = set(package_names)
+
+            current_entry = []
+            current_package = None
+            current_version = None
+
+            for line in src_packages_content.split('\n'):
+                if line.strip() == '':
+                    if current_entry and current_package:
+                        # Check if this package should be replicated
+                        should_replicate = False
+                        for pkg_name in package_names:
+                            if '_' in pkg_name:
+                                # Format: package_version
+                                if f"{current_package}_{current_version}" == pkg_name:
+                                    should_replicate = True
+                                    missing_packages.discard(pkg_name)
+                                    break
+                            else:
+                                # Just package name - replicate this version
+                                if current_package == pkg_name:
+                                    should_replicate = True
+                                    missing_packages.discard(pkg_name)
+                                    break
+
+                        if should_replicate:
+                            selected_entries.append('\n'.join(current_entry) + '\n\n')
+                            replicated_packages.append(f"{current_package} {current_version}")
+                            print(f"    • {current_package} {current_version}")
+
+                    current_entry = []
+                    current_package = None
+                    current_version = None
+                else:
+                    current_entry.append(line)
+                    if line.startswith('Package:'):
+                        current_package = line.split(':', 1)[1].strip()
+                    elif line.startswith('Version:'):
+                        current_version = line.split(':', 1)[1].strip()
+
+            if missing_packages:
+                print(Colors.warning(f"  ⚠ Packages not found in source: {', '.join(missing_packages)}"))
+
+            if not selected_entries:
+                print(Colors.warning(f"  ⚠ No matching packages found for {a}"))
+                continue
+
+            # Check if destination repository exists, if not initialize it
+            if not self._repo_exists(dst_distribution, component, a):
+                print(f"  Creating new repository structure for {dst_distribution}/{component}/{a}...")
+                local_dir = os.path.join(self.cache_dir, dst_distribution, component, f"binary-{a}")
+                os.makedirs(local_dir, exist_ok=True)
+
+                # Create new Packages file with selected entries
+                local_packages = os.path.join(local_dir, 'Packages')
+                with open(local_packages, 'w') as f:
+                    f.write(''.join(selected_entries))
+            else:
+                # Merge with existing destination metadata
+                print(f"  Merging with existing repository...")
+                local_dir = os.path.join(self.cache_dir, dst_distribution, component, f"binary-{a}")
+                os.makedirs(local_dir, exist_ok=True)
+
+                dst_packages_path = f"dists/{dst_distribution}/{component}/binary-{a}/Packages"
+                local_packages = os.path.join(local_dir, 'Packages')
+
+                # Download existing destination Packages file
+                try:
+                    self.storage.download_file(dst_packages_path, local_packages)
+
+                    # Parse existing entries
+                    existing_entries = {}
+                    with open(local_packages, 'r') as f:
+                        content = f.read()
+
+                    current_entry = []
+                    current_package = None
+                    current_version = None
+
+                    for line in content.split('\n'):
+                        if line.strip() == '':
+                            if current_entry and current_package:
+                                key = f"{current_package}_{current_version}"
+                                existing_entries[key] = '\n'.join(current_entry) + '\n\n'
+                            current_entry = []
+                            current_package = None
+                            current_version = None
+                        else:
+                            current_entry.append(line)
+                            if line.startswith('Package:'):
+                                current_package = line.split(':', 1)[1].strip()
+                            elif line.startswith('Version:'):
+                                current_version = line.split(':', 1)[1].strip()
+
+                    # Merge new entries (overwrite existing)
+                    for entry in selected_entries:
+                        # Extract package and version from entry
+                        pkg = None
+                        ver = None
+                        for line in entry.split('\n'):
+                            if line.startswith('Package:'):
+                                pkg = line.split(':', 1)[1].strip()
+                            elif line.startswith('Version:'):
+                                ver = line.split(':', 1)[1].strip()
+                        if pkg and ver:
+                            existing_entries[f"{pkg}_{ver}"] = entry
+
+                    # Write merged Packages file
+                    with open(local_packages, 'w') as f:
+                        for key in sorted(existing_entries.keys()):
+                            f.write(existing_entries[key])
+
+                except Exception as e:
+                    # If download fails, start with just the selected entries
+                    print(Colors.warning(f"  ⚠ Could not download existing metadata: {e}"))
+                    with open(local_packages, 'w') as f:
+                        f.write(''.join(selected_entries))
+
+            # Compress Packages file
+            print("  Compressing metadata...")
+            with open(local_packages, 'rb') as f_in:
+                with gzip.open(local_packages + '.gz', 'wb') as f_out:
+                    f_out.write(f_in.read())
+
+            with open(local_packages, 'rb') as f_in:
+                with bz2.open(local_packages + '.bz2', 'wb') as f_out:
+                    f_out.write(f_in.read())
+
+            # Generate/update Release file
+            print("  Updating Release file...")
+            self._generate_release_file(dst_distribution, local_dir)
+
+            # Upload metadata
+            print("  Uploading metadata...")
+            self._upload_metadata(dst_distribution, component, a, local_dir)
+
+            # Verify pool files exist
+            print("  Verifying pool files...")
+            for entry in selected_entries:
+                for line in entry.split('\n'):
+                    if line.startswith('Filename:'):
+                        filename = line.split(':', 1)[1].strip()
+                        if not self.storage.exists(filename):
+                            print(Colors.warning(f"    ⚠ Pool file missing: {filename}"))
+
+            print(Colors.success(f"  ✓ Replicated {len(replicated_packages)} package(s) for {a}"))
+
+        # Clean up backup on success
+        self._cleanup_backup()
+
+        print(Colors.success(f"\n✓ Replication complete: {self.storage.get_url()}/{dst_distribution}/{component}"))
     
     @staticmethod
     def _calculate_md5(filepath):
