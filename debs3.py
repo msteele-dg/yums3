@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-yums3 - Efficient YUM repository manager for S3
+Debian repository manager
 
 Copyright (c) 2025 Deepgram
 Author: Michael Steele <michael.steele@deepgram.com>
@@ -8,26 +8,20 @@ Author: Michael Steele <michael.steele@deepgram.com>
 Licensed under the MIT License. See LICENSE file for details.
 """
 
+
 import argparse
 import os
 import sys
 import re
 
 from core.config import load_config, config_command
-from core.yum import YumRepo
+from core.deb import DebRepo
 from core import Colors
-
-try:
-    from lxml import etree as ET
-except ImportError:
-    print("ERROR: lxml is not installed. Install it with: pip install lxml")
-    sys.exit(1)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Efficient YUM repository manager for S3',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Efficient Debian repository manager for S3',
     )
     
     # Global options
@@ -42,20 +36,35 @@ def main():
     
     # Add subcommand
     add_parser = subparsers.add_parser('add', help='Add packages to repository')
-    add_parser.add_argument('rpm_files', nargs='+', help='RPM file(s) to add')
+    add_parser.add_argument('deb_files', nargs='+', help='Debian package file(s) to add')
     add_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
     add_parser.add_argument('--no-validate', action='store_true', help='Skip post-operation validation')
+    add_parser.add_argument('--distribution', help='Override distribution detection')
+    add_parser.add_argument('--component', help='Override component detection')
     
     # Remove subcommand
     remove_parser = subparsers.add_parser('remove', help='Remove packages from repository')
-    remove_parser.add_argument('rpm_files', nargs='+', help='RPM filename(s) to remove')
+    remove_parser.add_argument('package_names', nargs='+', help='Package name(s) to remove')
     remove_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
-    remove_parser.add_argument('--no-validate', action='store_true', help='Skip post-operation validation')
+    remove_parser.add_argument('--distribution', help='Distribution name')
+    remove_parser.add_argument('--component', help='Component name')
+    remove_parser.add_argument('--architecture', help='Architecture')
     
     # Validate subcommand
     validate_parser = subparsers.add_parser('validate', help='Validate repository')
-    validate_parser.add_argument('repo_path', help='Repository path (e.g., el9/x86_64)')
-    
+    validate_parser.add_argument('distribution', help='Distribution name (e.g., focal)')
+    validate_parser.add_argument('component', help='Component name (e.g., main)')
+    validate_parser.add_argument('architecture', help='Architecture (e.g., amd64)')
+
+    replicate_parser = subparsers.add_parser('replicate', help="Replicate packages between distributions")
+    replicate_parser.add_argument('package_names', nargs='+', help='Package name(s) or package_version to replicate')
+    replicate_parser.add_argument('--src', required=True, help='Source distribution (e.g., focal)')
+    replicate_parser.add_argument('--dst', required=True, help='Destination distribution (e.g., noble)')
+    replicate_parser.add_argument('--component', help='Component (defaults to config)', default=None)
+    replicate_parser.add_argument('--arch', help='Architecture (defaults to config architectures)', default=None)
+    replicate_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
+
+
     # Config subcommand
     config_parser = subparsers.add_parser('config', help='Manage configuration')
     config_parser.add_argument('key', nargs='?', help='Config key (dot notation)')
@@ -64,9 +73,9 @@ def main():
     config_parser.add_argument('--unset', metavar='KEY', help='Remove a config key')
     config_parser.add_argument('--validate', dest='validate_config', action='store_true', help='Validate configuration')
     config_parser.add_argument('--file', help='Use specific config file')
-    config_parser.add_argument('--global', dest='global_config', action='store_true', help='Use global config (~/.yums3.conf)')
-    config_parser.add_argument('--local', action='store_true', help='Use local config (./yums3.conf)')
-    config_parser.add_argument('--system', action='store_true', help='Use system config (/etc/yums3.conf)')
+    config_parser.add_argument('--global', dest='global_config', action='store_true', help='Use global config (~/.debs3.conf)')
+    config_parser.add_argument('--local', action='store_true', help='Use local config (./debs3.conf)')
+    config_parser.add_argument('--system', action='store_true', help='Use system config (/etc/debs3.conf)')
     
     args = parser.parse_args()
     
@@ -76,8 +85,7 @@ def main():
     
     # Load configuration
     try:
-        config = load_config(args, 'yum')
-        print(config)
+        config = load_config(args, 'deb')
         
         # Apply CLI argument overrides
         if args.bucket:
@@ -90,64 +98,81 @@ def main():
             config.set('backend.s3.profile', args.profile)
         if hasattr(args, 'no_validate') and args.no_validate:
             config.set('validation.enabled', False)
-                
-        # Initialize repository manager
-        repo = YumRepo(config)
-        print(repo)
         
+        # Initialize repository manager
+        repo = DebRepo(config)
+
+        action = args.command.upper()
+
         # Handle validate command
         if args.command == 'validate':
-            # Parse el_version/arch
-            parts = args.repo_path.split('/')
-            if len(parts) != 2:
-                print(Colors.error("✗ Error: Invalid format. Use: el_version/arch (e.g., el9/x86_64)"))
-                return 1
-            
-            el_version, arch = parts
-            success = repo.validate_repository(el_version, arch)
+            success = repo.validate_repository(args.distribution, args.component, args.architecture)
             return 0 if success else 1
-        
-        # Determine operation details based on command
-        if args.command == 'remove':
-            rpm_filenames = [os.path.basename(f) for f in args.rpm_files]
-            arch, el_version = repo._detect_from_filename(rpm_filenames[0])
-        elif args.command == 'add':
-            rpm_filenames = args.rpm_files
-            arch, el_version = repo._detect_from_rpm(args.rpm_files[0])
-        else:
-            print(Colors.error(f"✗ Unknown command: {args.command}"))
-            return 1
-        action = args.command.upper()
-        target = f"{repo.storage.get_url()}/{el_version}/{arch}"
-        
-        # Show confirmation
+
+        # Handle replicate command
+        if args.command == 'replicate':
+            print()
+            print(Colors.bold("Configuration:"))
+
+            backend_info = repo.storage.get_info()
+            for key, value in backend_info.items():
+                print(f"  {key:<11}: {value}")
+
+            print(f"  Action:       {Colors.bold('REPLICATE')}")
+            print(f"  Source:       {args.src}")
+            print(f"  Destination:  {args.dst}")
+            print(f"  Packages:     {len(args.package_names)}")
+            for pkg in args.package_names:
+                print(f"    • {pkg}")
+            print()
+
+            # Confirm operation
+            if not args.yes:
+                response = input(Colors.bold("Continue? (yes/no): "))
+                if response.lower() != "yes":
+                    print(Colors.warning("Cancelled"))
+                    return 0
+
+            repo.replicate_distribution(
+                args.src,
+                args.dst,
+                args.package_names,
+                component=args.component,
+                arch=args.arch
+            )
+            return 0
+
+        # Get backend info and show confirmation
         print()
         print(Colors.bold("Configuration:"))
-        
-        # Get backend info and display it
+
         backend_info = repo.storage.get_info()
         for key, value in backend_info.items():
-            print(f"  {key}:  {value}")
-        
-        print(f"  Target:       {target}")
+            print(f"  {key:<11}: {value}")
+
         print(f"  Action:       {Colors.bold(action)}")
-        print(f"  Packages:     {len(args.rpm_files)}")
-        for f in args.rpm_files:
+        print(f"  Packages:     {len(args.deb_files)}")
+        for f in args.deb_files:
             print(f"    • {os.path.basename(f)}")
         print()
-        
+
         # Confirm operation
         if not args.yes:
             response = input(Colors.bold("Continue? (yes/no): "))
             if response.lower() != "yes":
                 print(Colors.warning("Cancelled"))
                 return 0
-        
-        # Execute operation
-        if args.command == 'remove':
-            repo.remove_packages(rpm_filenames)
-        elif args.command == 'add':
-            repo.add_packages(args.rpm_files)
+
+        # Execute Operation
+        if args.command == 'add':
+            repo.add_packages(args.deb_files)
+        elif args.command == 'remove':
+            repo.remove_packages(
+                args.package_names,
+                distribution=args.distribution,
+                component=args.component,
+                arch=args.architecture
+            )
         
         return 0
         

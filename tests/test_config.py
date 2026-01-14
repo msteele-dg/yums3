@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test YumConfig class
+Test RepoConfig class
 
 Tests dot notation configuration, legacy migration, and validation.
 """
@@ -11,12 +11,61 @@ import tempfile
 import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from core.backend import create_storage_backend
+from core.config import RepoConfig
 
-from core.config import YumConfig, create_storage_backend_from_config
+
+def test_type_specific_config():
+    """Test type-specific configuration with fallback"""
+    print("=" * 60)
+    print("Test: Type-Specific Configuration")
+    print("=" * 60)
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
+        config_file = f.name
+        json.dump({}, f)
+    
+    try:
+        config = RepoConfig(config_file)
+        
+        # Test with only shared config
+        config.set('backend.s3.bucket', 'shared-bucket')
+        assert config.get_for_type('backend.s3.bucket', 'rpm') == 'shared-bucket'
+        assert config.get_for_type('backend.s3.bucket', 'deb') == 'shared-bucket'
+        print("✓ Shared config works for both types")
+        
+        # Test with type-specific override
+        config.set('backend.rpm.s3.bucket', 'rpm-bucket')
+        assert config.get_for_type('backend.s3.bucket', 'rpm') == 'rpm-bucket'
+        assert config.get_for_type('backend.s3.bucket', 'deb') == 'shared-bucket'
+        print("✓ Type-specific override works")
+        
+        # Test with both type-specific configs
+        config.set('backend.deb.s3.bucket', 'deb-bucket')
+        assert config.get_for_type('backend.s3.bucket', 'rpm') == 'rpm-bucket'
+        assert config.get_for_type('backend.s3.bucket', 'deb') == 'deb-bucket'
+        print("✓ Both type-specific configs work independently")
+        
+        # Test with default value
+        assert config.get_for_type('backend.s3.profile', 'rpm', 'default-profile') == 'default-profile'
+        print("✓ Default value works when key not set")
+        
+        # Test cache_dir
+        config.set('repo.rpm.cache_dir', '/var/cache/yums3')
+        config.set('repo.deb.cache_dir', '/var/cache/debs3')
+        assert config.get('repo.rpm.cache_dir') == '/var/cache/yums3'
+        assert config.get('repo.deb.cache_dir') == '/var/cache/debs3'
+        print("✓ Type-specific cache directories work")
+        
+        return True
+    
+    finally:
+        os.unlink(config_file)
 
 
 def test_basic_operations():
     """Test basic get/set/unset operations"""
+    print()
     print("=" * 60)
     print("Test: Basic Operations")
     print("=" * 60)
@@ -26,7 +75,7 @@ def test_basic_operations():
         json.dump({}, f)
     
     try:
-        config = YumConfig(config_file)
+        config = RepoConfig(config_file)
         
         # Test set and get
         config.set('backend.type', 's3')
@@ -87,7 +136,7 @@ def test_save_and_load():
     
     try:
         # Create and save config
-        config1 = YumConfig(config_file)
+        config1 = RepoConfig(config_file)
         config1.set('backend.type', 's3')
         config1.set('backend.s3.bucket', 'my-bucket')
         config1.set('backend.s3.profile', 'production')
@@ -95,7 +144,7 @@ def test_save_and_load():
         print("✓ Config saved")
         
         # Load in new instance
-        config2 = YumConfig(config_file)
+        config2 = RepoConfig(config_file)
         assert config2.get('backend.type') == 's3'
         assert config2.get('backend.s3.bucket') == 'my-bucket'
         assert config2.get('backend.s3.profile') == 'production'
@@ -107,48 +156,6 @@ def test_save_and_load():
         assert 'backend.type' in data
         assert 'backend.s3.bucket' in data
         print("✓ File format is correct (dot notation)")
-        
-        return True
-    
-    finally:
-        os.unlink(config_file)
-
-
-def test_legacy_migration():
-    """Test automatic migration from legacy config format"""
-    print()
-    print("=" * 60)
-    print("Test: Legacy Migration")
-    print("=" * 60)
-    
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
-        config_file = f.name
-        # Write old format config
-        legacy_config = {
-            'storage_type': 's3',
-            's3_bucket': 'old-bucket',
-            'aws_profile': 'old-profile',
-            'local_repo_base': '/old/cache'
-        }
-        json.dump(legacy_config, f)
-    
-    try:
-        # Load with auto-migration
-        config = YumConfig(config_file, auto_migrate=True)
-        
-        # Check migrated values
-        assert config.get('backend.type') == 's3'
-        assert config.get('backend.s3.bucket') == 'old-bucket'
-        assert config.get('backend.s3.profile') == 'old-profile'
-        assert config.get('repo.cache_dir') == '/old/cache'
-        print("✓ Legacy config migrated correctly")
-        
-        # Verify file was updated
-        with open(config_file, 'r') as f:
-            data = json.load(f)
-        assert 'backend.type' in data
-        assert 's3_bucket' not in data  # Old key should be gone
-        print("✓ Config file updated to new format")
         
         return True
     
@@ -168,40 +175,22 @@ def test_validation():
         json.dump({}, f)
     
     try:
-        # Valid S3 config
-        config = YumConfig(config_file)
+        # Valid backend type
+        config = RepoConfig(config_file)
         config.set('backend.type', 's3')
-        config.set('backend.s3.bucket', 'test-bucket')
         errors = config.validate()
         assert len(errors) == 0
-        print("✓ Valid S3 config passes validation")
+        print("✓ Valid backend type passes validation")
         
-        # Invalid: missing bucket
-        config2 = YumConfig(config_file)
-        config2.set('backend.type', 's3')
+        # Valid backend type (local)
+        config2 = RepoConfig(config_file)
+        config2.set('backend.type', 'local')
         errors = config2.validate()
-        assert len(errors) > 0
-        assert any('bucket' in err.lower() for err in errors)
-        print("✓ Missing bucket detected")
-        
-        # Valid local config
-        config3 = YumConfig(config_file)
-        config3.set('backend.type', 'local')
-        config3.set('backend.local.path', '/tmp/test')
-        errors = config3.validate()
         assert len(errors) == 0
-        print("✓ Valid local config passes validation")
-        
-        # Invalid: missing path
-        config4 = YumConfig(config_file)
-        config4.set('backend.type', 'local')
-        errors = config4.validate()
-        assert len(errors) > 0
-        assert any('path' in err.lower() for err in errors)
-        print("✓ Missing path detected")
+        print("✓ Valid local backend type passes validation")
         
         # Invalid backend type
-        config5 = YumConfig(config_file)
+        config5 = RepoConfig(config_file)
         config5.set('backend.type', 'invalid')
         errors = config5.validate()
         assert len(errors) > 0
@@ -226,27 +215,51 @@ def test_storage_backend_creation():
         json.dump({}, f)
     
     try:
-        # Create S3 backend
-        config = YumConfig(config_file)
+        # Create S3 backend (shared config)
+        config = RepoConfig(config_file)
         config.set('backend.type', 's3')
         config.set('backend.s3.bucket', 'test-bucket')
         config.set('backend.s3.profile', 'default')
         
-        backend = create_storage_backend_from_config(config)
+        backend = create_storage_backend(config, 'rpm')
         assert backend is not None
         assert hasattr(backend, 'bucket_name')
         assert backend.bucket_name == 'test-bucket'
-        print("✓ S3 backend created correctly")
+        print("✓ S3 backend created correctly (shared config)")
+        
+        # Create S3 backend (type-specific config)
+        config1b = RepoConfig(config_file)
+        config1b.set('backend.type', 's3')
+        config1b.set('backend.rpm.s3.bucket', 'rpm-bucket')
+        config1b.set('backend.deb.s3.bucket', 'deb-bucket')
+        
+        rpm_backend = create_storage_backend(config1b, 'rpm')
+        assert rpm_backend.bucket_name == 'rpm-bucket'
+        deb_backend = create_storage_backend(config1b, 'deb')
+        assert deb_backend.bucket_name == 'deb-bucket'
+        print("✓ S3 backend created correctly (type-specific config)")
         
         # Create local backend
-        config2 = YumConfig(config_file)
+        config2 = RepoConfig(config_file)
         config2.set('backend.type', 'local')
         config2.set('backend.local.path', '/tmp/test')
         
-        backend2 = create_storage_backend_from_config(config2)
+        backend2 = create_storage_backend(config2, 'rpm')
         assert backend2 is not None
         assert hasattr(backend2, 'base_path')
-        print("✓ Local backend created correctly")
+        print("✓ Local backend created correctly (shared config)")
+        
+        # Create local backend (type-specific)
+        config2b = RepoConfig(config_file)
+        config2b.set('backend.type', 'local')
+        config2b.set('backend.rpm.local.path', '/tmp/rpm')
+        config2b.set('backend.deb.local.path', '/tmp/deb')
+        
+        rpm_backend2 = create_storage_backend(config2b, 'rpm')
+        assert rpm_backend2.base_path == '/tmp/rpm'
+        deb_backend2 = create_storage_backend(config2b, 'deb')
+        assert deb_backend2.base_path == '/tmp/deb'
+        print("✓ Local backend created correctly (type-specific config)")
         
         return True
     
@@ -263,25 +276,25 @@ def test_real_world_scenario():
     
     with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
         config_file = f.name
-        # Start with legacy config
-        legacy_config = {
-            'storage_type': 's3',
-            's3_bucket': 'my-yum-repo',
-            'aws_profile': 'production',
-            's3_endpoint_url': 'https://s3.us-west-2.amazonaws.com',
-            'local_repo_base': '/var/cache/yums3'
+        # Start with a config
+        test_config = {
+            'backend.type': 's3',
+            'backend.s3.bucket': 'my-yum-repo',
+            'backend.s3.profile': 'production',
+            'backend.s3.endpoint': 'https://s3.us-west-2.amazonaws.com',
+            'repo.rpm.cache_dir': '/var/cache/yums3'
         }
-        json.dump(legacy_config, f)
+        json.dump(test_config, f)
     
     try:
-        # Load and migrate
-        config = YumConfig(config_file)
+        # Load config
+        config = RepoConfig(config_file)
         print(f"✓ Loaded config from {config_file}")
         
-        # Verify migration
+        # Verify values
         assert config.get('backend.type') == 's3'
         assert config.get('backend.s3.bucket') == 'my-yum-repo'
-        print("✓ Legacy config migrated")
+        print("✓ Config loaded correctly")
         
         # Validate
         errors = config.validate()
@@ -292,7 +305,7 @@ def test_real_world_scenario():
         
         # Create backend (skip if AWS profile doesn't exist)
         try:
-            backend = create_storage_backend_from_config(config)
+            backend = create_storage_backend(config)
             print(f"✓ Created backend: {backend.get_url()}")
         except Exception as e:
             # AWS profile might not exist in test environment
@@ -304,7 +317,7 @@ def test_real_world_scenario():
         print("✓ Modified and saved config")
         
         # Reload and verify
-        config2 = YumConfig(config_file)
+        config2 = RepoConfig(config_file)
         assert config2.get('validation.enabled') == False
         assert config2.get('backend.s3.bucket') == 'my-yum-repo'
         print("✓ Reloaded config correctly")
@@ -317,13 +330,13 @@ def test_real_world_scenario():
 
 if __name__ == '__main__':
     print()
-    print("YumConfig Test Suite")
+    print("RepoConfig Test Suite")
     print()
     
     tests = [
+        test_type_specific_config,
         test_basic_operations,
         test_save_and_load,
-        test_legacy_migration,
         test_validation,
         test_storage_backend_creation,
         test_real_world_scenario,
