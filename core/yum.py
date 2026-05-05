@@ -1457,6 +1457,399 @@ class YumRepo:
         """
         return self.calculate_checksum(rpm_file)
     
+    def replicate_distro(self, src_distro, dst_distro, package_names, arch=None):
+        """
+        Replicate specific RPM packages from one distro to another.
+
+        Args:
+            src_distro: Source distro (e.g., 'el9')
+            dst_distro: Destination distro (e.g., 'el10')
+            package_names: List of package names to replicate (e.g., ['libtorch', 'myapp'])
+            arch: Architecture (e.g., 'x86_64'). If None, uses 'x86_64' as default
+        """
+        arch = arch or 'x86_64'
+
+        src_repo_path = f"{src_distro}/{arch}"
+        dst_repo_path = f"{dst_distro}/{arch}"
+
+        print(Colors.info(f"Replicating packages from {src_repo_path} → {dst_repo_path}"))
+        print(Colors.info(f"Packages: {', '.join(package_names)}"))
+
+        # Check if source repository exists
+        if not self._repo_exists(src_repo_path):
+            raise ValueError(f"Source repository does not exist: {src_repo_path}")
+
+        # Download source repodata
+        print("\nDownloading source metadata...")
+        src_repo_dir = os.path.join(self.cache_dir, f"{src_distro}-{arch}-src")
+        os.makedirs(src_repo_dir, exist_ok=True)
+        self.storage.sync_from_storage(f"{src_repo_path}/repodata", f"{src_repo_dir}/repodata")
+
+        # Parse source primary.xml to find packages
+        print("Parsing source metadata...")
+        selected_packages = self._filter_packages_from_metadata(
+            src_repo_dir,
+            src_repo_path,
+            package_names
+        )
+
+        if not selected_packages:
+            print(Colors.warning("⚠ No matching packages found in source repository"))
+            return
+
+        print(f"\nFound {len(selected_packages)} package(s) to replicate:")
+        for pkg in selected_packages:
+            print(f"  • {pkg['filename']}")
+
+        # Check if destination exists
+        dst_repo_dir = os.path.join(self.cache_dir, f"{dst_distro}-{arch}")
+        os.makedirs(dst_repo_dir, exist_ok=True)
+
+        if not self._repo_exists(dst_repo_path):
+            print(f"\nCreating new repository at {dst_repo_path}...")
+            self._create_repo_from_packages(selected_packages, dst_repo_dir, dst_repo_path)
+        else:
+            print(f"\nMerging with existing repository at {dst_repo_path}...")
+            self._merge_packages_into_repo(selected_packages, dst_repo_dir, dst_repo_path)
+
+        print(Colors.success(f"\n✓ Replication complete: {self.storage.get_url()}/{dst_repo_path}"))
+
+    def _filter_packages_from_metadata(self, repo_dir, repo_path, package_names):
+        """
+        Filter packages from source metadata
+
+        Args:
+            repo_dir: Local repository directory
+            repo_path: Repository path in storage
+            package_names: List of package names to filter
+
+        Returns:
+            list: List of package dicts with metadata
+        """
+        import io
+
+        repodata_dir = os.path.join(repo_dir, 'repodata')
+
+        # Parse repomd.xml to find primary.xml
+        repomd_path = os.path.join(repodata_dir, 'repomd.xml')
+        repomd_tree = ET.parse(repomd_path)
+        repomd_root = repomd_tree.getroot()
+
+        NS = {'repo': 'http://linux.duke.edu/metadata/repo'}
+        primary_location = None
+
+        for data in repomd_root.findall('repo:data', NS):
+            if data.get('type') == 'primary':
+                location = data.find('repo:location', NS)
+                if location is not None:
+                    primary_location = location.get('href').replace('repodata/', '')
+                    break
+
+        if not primary_location:
+            for data in repomd_root.findall('data'):
+                if data.get('type') == 'primary':
+                    location = data.find('location')
+                    if location is not None:
+                        primary_location = location.get('href').replace('repodata/', '')
+                        break
+
+        if not primary_location:
+            raise ValueError("Could not find primary metadata in source repository")
+
+        # Parse primary.xml
+        primary_path = os.path.join(repodata_dir, primary_location)
+        with gzip.open(primary_path, 'rt', encoding='utf-8') as f:
+            primary_tree = ET.parse(f)
+            primary_root = primary_tree.getroot()
+
+        # Filter packages
+        NS_COMMON = {'common': 'http://linux.duke.edu/metadata/common'}
+        packages = primary_root.findall('common:package', NS_COMMON)
+        if not packages:
+            packages = primary_root.findall('package')
+
+        selected = []
+        for package in packages:
+            name_elem = package.find('common:name', NS_COMMON)
+            if name_elem is None:
+                name_elem = package.find('name')
+
+            if name_elem is not None and name_elem.text in package_names:
+                location_elem = package.find('common:location', NS_COMMON)
+                if location_elem is None:
+                    location_elem = package.find('location')
+
+                if location_elem is not None:
+                    # Store the entire package element as XML string
+                    pkg_xml = ET.tostring(package, encoding='unicode')
+                    selected.append({
+                        'name': name_elem.text,
+                        'filename': os.path.basename(location_elem.get('href')),
+                        'location': location_elem.get('href'),
+                        'xml': pkg_xml
+                    })
+
+        return selected
+
+    def _create_repo_from_packages(self, packages, repo_dir, repo_path):
+        """
+        Create a new repository from selected packages
+
+        Args:
+            packages: List of package dicts
+            repo_dir: Local repository directory
+            repo_path: Repository path in storage
+        """
+        # Create repodata directory
+        repodata_dir = os.path.join(repo_dir, 'repodata')
+        os.makedirs(repodata_dir, exist_ok=True)
+
+        # Build primary.xml with selected packages
+        NS_COMMON = 'http://linux.duke.edu/metadata/common'
+        NS_RPM = 'http://linux.duke.edu/metadata/rpm'
+
+        ET.register_namespace('', NS_COMMON)
+        ET.register_namespace('rpm', NS_RPM)
+
+        metadata = ET.Element('metadata', {
+            'xmlns': NS_COMMON,
+            'xmlns:rpm': NS_RPM,
+            'packages': str(len(packages))
+        })
+
+        # Add each package element
+        for pkg in packages:
+            pkg_elem = ET.fromstring(pkg['xml'])
+            metadata.append(pkg_elem)
+
+        # Write primary.xml
+        primary_path = os.path.join(repodata_dir, 'primary.xml')
+        tree = ET.ElementTree(metadata)
+        tree.write(primary_path, encoding='utf-8', xml_declaration=True)
+
+        # Compress primary.xml
+        primary_gz_path = primary_path + '.gz'
+        with open(primary_path, 'rb') as f_in:
+            with gzip.open(primary_gz_path, 'wb') as f_out:
+                f_out.write(f_in.read())
+        os.remove(primary_path)
+
+        # Create minimal filelists.xml and other.xml
+        for xml_type in ['filelists', 'other']:
+            ns_uri = f'http://linux.duke.edu/metadata/{xml_type}'
+            ET.register_namespace('', ns_uri)
+            root = ET.Element(xml_type, {
+                'xmlns': ns_uri,
+                'packages': str(len(packages))
+            })
+            xml_path = os.path.join(repodata_dir, f'{xml_type}.xml')
+            tree = ET.ElementTree(root)
+            tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+
+            # Compress
+            with open(xml_path, 'rb') as f_in:
+                with gzip.open(xml_path + '.gz', 'wb') as f_out:
+                    f_out.write(f_in.read())
+            os.remove(xml_path)
+
+        # Generate repomd.xml
+        self._generate_repomd(repodata_dir)
+
+        # Create SQLite databases
+        print("  Creating SQLite databases...")
+        self._create_sqlite_databases(repodata_dir)
+
+        # Upload to storage
+        print("  Uploading metadata...")
+        self.storage.sync_to_storage(f"{repo_dir}/repodata", f"{repo_path}/repodata")
+
+        print(Colors.success(f"  ✓ Created repository with {len(packages)} package(s)"))
+
+    def _merge_packages_into_repo(self, packages, repo_dir, repo_path):
+        """
+        Merge packages into existing repository
+
+        Args:
+            packages: List of package dicts
+            repo_dir: Local repository directory
+            repo_path: Repository path in storage
+        """
+        # Download existing metadata
+        print("  Downloading existing metadata...")
+        self.storage.sync_from_storage(f"{repo_path}/repodata", f"{repo_dir}/repodata")
+
+        # Backup before making changes
+        self._backup_metadata(repo_dir, repo_path)
+
+        try:
+            repodata_dir = os.path.join(repo_dir, 'repodata')
+
+            # Parse existing repomd.xml
+            repomd_path = os.path.join(repodata_dir, 'repomd.xml')
+            repomd_tree = ET.parse(repomd_path)
+            repomd_root = repomd_tree.getroot()
+
+            NS = {'repo': 'http://linux.duke.edu/metadata/repo'}
+            primary_location = None
+
+            for data in repomd_root.findall('repo:data', NS):
+                if data.get('type') == 'primary':
+                    location = data.find('repo:location', NS)
+                    if location is not None:
+                        primary_location = location.get('href').replace('repodata/', '')
+                        break
+
+            if not primary_location:
+                for data in repomd_root.findall('data'):
+                    if data.get('type') == 'primary':
+                        location = data.find('location')
+                        if location is not None:
+                            primary_location = location.get('href').replace('repodata/', '')
+                            break
+
+            # Parse existing primary.xml
+            primary_path = os.path.join(repodata_dir, primary_location)
+            with gzip.open(primary_path, 'rt', encoding='utf-8') as f:
+                primary_tree = ET.parse(f)
+                primary_root = primary_tree.getroot()
+
+            # Merge packages (replace if exists)
+            NS_COMMON = {'common': 'http://linux.duke.edu/metadata/common'}
+            existing_packages = {}
+
+            for pkg_elem in primary_root.findall('common:package', NS_COMMON):
+                name_elem = pkg_elem.find('common:name', NS_COMMON)
+                if name_elem is None:
+                    name_elem = pkg_elem.find('name')
+                if name_elem is not None:
+                    existing_packages[name_elem.text] = pkg_elem
+
+            # Add/replace packages
+            for pkg in packages:
+                if pkg['name'] in existing_packages:
+                    # Remove old version
+                    primary_root.remove(existing_packages[pkg['name']])
+                    print(f"  ↻ Updating {pkg['filename']}")
+                else:
+                    print(f"  + Adding {pkg['filename']}")
+
+                # Add new version
+                pkg_elem = ET.fromstring(pkg['xml'])
+                primary_root.append(pkg_elem)
+
+            # Update package count
+            primary_root.set('packages', str(len(primary_root.findall('common:package', NS_COMMON))))
+
+            # Write updated primary.xml
+            new_primary_path = os.path.join(repodata_dir, 'primary.xml')
+            primary_tree.write(new_primary_path, encoding='utf-8', xml_declaration=True)
+
+            # Compress
+            new_primary_gz = new_primary_path + '.gz'
+            with open(new_primary_path, 'rb') as f_in:
+                with gzip.open(new_primary_gz, 'wb') as f_out:
+                    f_out.write(f_in.read())
+            os.remove(new_primary_path)
+            os.remove(primary_path)
+
+            # Update other metadata files (filelists, other) - regenerate
+            # For simplicity, we'll regenerate repomd
+            self._generate_repomd(repodata_dir)
+
+            # Create SQLite databases
+            print("  Updating SQLite databases...")
+            self._create_sqlite_databases(repodata_dir)
+
+            # Upload updated metadata
+            print("  Uploading updated metadata...")
+            self.storage.sync_to_storage(f"{repo_dir}/repodata", f"{repo_path}/repodata")
+
+            # Cleanup backup
+            self._cleanup_backup()
+
+            print(Colors.success(f"  ✓ Merged {len(packages)} package(s) into repository"))
+
+        except Exception as e:
+            print(Colors.error(f"✗ Operation failed: {e}"))
+            print(Colors.warning("Restoring metadata from backup..."))
+            self._restore_metadata(repo_path)
+            raise
+
+    def _generate_repomd(self, repodata_dir):
+        """Generate repomd.xml from existing metadata files"""
+        NS = 'http://linux.duke.edu/metadata/repo'
+        ET.register_namespace('', NS)
+
+        repomd = ET.Element('repomd', {'xmlns': NS})
+
+        # Add revision
+        revision = ET.SubElement(repomd, 'revision')
+        revision.text = str(int(datetime.now().timestamp()))
+
+        # Add data elements for each metadata file
+        for metadata_type in ['primary', 'filelists', 'other']:
+            gz_file = f'{metadata_type}.xml.gz'
+            gz_path = os.path.join(repodata_dir, gz_file)
+
+            if os.path.exists(gz_path):
+                data = ET.SubElement(repomd, 'data', {'type': metadata_type})
+
+                checksum = self.calculate_checksum(gz_path)
+                checksum_elem = ET.SubElement(data, 'checksum', {'type': 'sha256'})
+                checksum_elem.text = checksum
+
+                # Open checksum (uncompressed)
+                with gzip.open(gz_path, 'rb') as f:
+                    uncompressed = f.read()
+                    open_checksum = hashlib.sha256(uncompressed).hexdigest()
+                open_checksum_elem = ET.SubElement(data, 'open-checksum', {'type': 'sha256'})
+                open_checksum_elem.text = open_checksum
+
+                location = ET.SubElement(data, 'location', {'href': f'repodata/{gz_file}'})
+
+                timestamp = ET.SubElement(data, 'timestamp')
+                timestamp.text = str(int(os.path.getmtime(gz_path)))
+
+                size = ET.SubElement(data, 'size')
+                size.text = str(os.path.getsize(gz_path))
+
+                open_size = ET.SubElement(data, 'open-size')
+                open_size.text = str(len(uncompressed))
+
+        # Write repomd.xml
+        repomd_path = os.path.join(repodata_dir, 'repomd.xml')
+        tree = ET.ElementTree(repomd)
+        tree.write(repomd_path, encoding='utf-8', xml_declaration=True)
+
+    def _create_sqlite_databases(self, repodata_dir):
+        """Create SQLite databases from XML metadata"""
+        sqlite_mgr = SQLiteMetadataManager(repodata_dir)
+
+        metadata_files = {}
+        for meta_type in ['primary', 'filelists', 'other']:
+            gz_file = f'{meta_type}.xml.gz'
+            gz_path = os.path.join(repodata_dir, gz_file)
+            if os.path.exists(gz_path):
+                metadata_files[meta_type] = gz_path
+
+        if metadata_files:
+            db_files = sqlite_mgr.create_all_databases(metadata_files)
+            compressed_dbs = {}
+            for db_type, db_path in db_files.items():
+                compressed_dbs[db_type] = sqlite_mgr.compress_sqlite(db_path)
+
+            # Update repomd.xml with database entries
+            repomd_path = os.path.join(repodata_dir, 'repomd.xml')
+            repomd_tree = ET.parse(repomd_path)
+            repomd_root = repomd_tree.getroot()
+
+            for db_type, db_path in compressed_dbs.items():
+                self._add_database_to_repomd(repomd_root, repodata_dir, db_type, db_path)
+
+            # Write updated repomd.xml
+            with open(repomd_path, 'wb') as f:
+                repomd_tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=False)
+
     @staticmethod
     def calculate_checksum(filepath):
         """Calculate SHA256 checksum of a file"""

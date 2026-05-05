@@ -55,7 +55,15 @@ def main():
     # Validate subcommand
     validate_parser = subparsers.add_parser('validate', help='Validate repository')
     validate_parser.add_argument('repo_path', help='Repository path (e.g., el9/x86_64)')
-    
+
+    # Replicate subcommand
+    replicate_parser = subparsers.add_parser('replicate', help='Replicate packages between distros')
+    replicate_parser.add_argument('package_names', nargs='+', help='Package name(s) to replicate')
+    replicate_parser.add_argument('--src', required=True, help='Source distro (e.g., el9)')
+    replicate_parser.add_argument('--dst', required=True, help='Destination distro (e.g., el10)')
+    replicate_parser.add_argument('--arch', help='Architecture (defaults to x86_64)', default=None)
+    replicate_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (for CI/CD)')
+
     # Config subcommand
     config_parser = subparsers.add_parser('config', help='Manage configuration')
     config_parser.add_argument('key', nargs='?', help='Config key (dot notation)')
@@ -102,10 +110,43 @@ def main():
             if len(parts) != 2:
                 print(Colors.error("✗ Error: Invalid format. Use: el_version/arch (e.g., el9/x86_64)"))
                 return 1
-            
+
             el_version, arch = parts
             success = repo.validate_repository(el_version, arch)
             return 0 if success else 1
+
+        # Handle replicate command
+        if args.command == 'replicate':
+            print()
+            print(Colors.bold("Configuration:"))
+
+            backend_info = repo.storage.get_info()
+            for key, value in backend_info.items():
+                print(f"  {key}:  {value}")
+
+            print(f"  Action:       {Colors.bold('REPLICATE')}")
+            print(f"  Source:       {args.src}")
+            print(f"  Destination:  {args.dst}")
+            print(f"  Architecture: {args.arch or 'x86_64'}")
+            print(f"  Packages:     {len(args.package_names)}")
+            for pkg in args.package_names:
+                print(f"    • {pkg}")
+            print()
+
+            # Confirm operation
+            if not args.yes:
+                response = input(Colors.bold("Continue? (yes/no): "))
+                if response.lower() != "yes":
+                    print(Colors.warning("Cancelled"))
+                    return 0
+
+            repo.replicate_distro(
+                args.src,
+                args.dst,
+                args.package_names,
+                arch=args.arch
+            )
+            return 0
         
         # Determine operation details based on command
         if args.command == 'remove':
