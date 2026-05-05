@@ -71,7 +71,6 @@ def main():
     config_parser.add_argument('--list', action='store_true', help='List all config values')
     config_parser.add_argument('--unset', metavar='KEY', help='Remove a config key')
     config_parser.add_argument('--validate', dest='validate_config', action='store_true', help='Validate configuration')
-    config_parser.add_argument('--file', help='Use specific config file')
     config_parser.add_argument('--global', dest='global_config', action='store_true', help='Use global config (~/.yums3.conf)')
     config_parser.add_argument('--local', action='store_true', help='Use local config (./yums3.conf)')
     config_parser.add_argument('--system', action='store_true', help='Use system config (/etc/yums3.conf)')

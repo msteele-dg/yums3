@@ -17,8 +17,8 @@ from core.constants import (
 )
 
 def load_config(args, repo_type):
-    if 'file' in args and args.file:
-        config_file = args.file
+    if hasattr(args, 'config') and args.config:
+        config_file = args.config
     elif 'system' in args and args.system:
         config_file = RepoConfigFiles.SYSTEM
     elif 'local' in args and args.local:

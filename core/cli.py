@@ -11,7 +11,7 @@ import argparse
 import os
 import sys
 
-from core.config import RepoConfig
+from core.config import load_config
 from core.constants import REPO_CONFIG_FILES
 from core import Colors
 
@@ -29,20 +29,10 @@ def create_repo_manager(config, repo_type):
 
 
 def config_command(args, repo_type):
-    """Handle config subcommand"""
-    if args.file:
-        config_file = args.file
-    elif args.system:
-        config_file = REPO_CONFIG_FILES.get("system")
-    elif args.local:
-        config_file = REPO_CONFIG_FILES.get("local")
-    else:  # --global or default
-        config_file = REPO_CONFIG_FILES.get("user")
-    
-    config = RepoConfig(config_file, repo_type)
+    config = load_config(args, repo_type)
 
     if args.list:
-        print(f"Reading {config_file}")
+        print(f"Reading {config.config_file}")
         print("="*40)
         for key, value in sorted(config.list().items()):
             print(f"{key}={value}{'*' if key in config.track_defaults else ''}")
@@ -145,7 +135,6 @@ def create_parser(repo_type):
     config_parser.add_argument('--list', action='store_true', help='List all config values')
     config_parser.add_argument('--unset', metavar='KEY', help='Remove a config key')
     config_parser.add_argument('--validate', dest='validate_config', action='store_true', help='Validate configuration')
-    config_parser.add_argument('--file', help='Use specific config file')
     config_parser.add_argument('--global', dest='global_config', action='store_true', help='Use global config')
     config_parser.add_argument('--local', action='store_true', help='Use local config')
     config_parser.add_argument('--system', action='store_true', help='Use system config')

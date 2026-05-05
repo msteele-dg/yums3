@@ -68,7 +68,7 @@ def test_config_set_and_get():
         
         # Set a value
         returncode, stdout, stderr = run_command([
-            'config', '--file', config_file,
+            '--config', config_file, 'config',
             'backend.type', 'local'
         ])
         assert returncode == 0, f"Set failed: {stderr}"
@@ -77,7 +77,7 @@ def test_config_set_and_get():
         
         # Get the value
         returncode, stdout, stderr = run_command([
-            'config', '--file', config_file,
+            '--config', config_file, 'config',
             'backend.type'
         ])
         assert returncode == 0, f"Get failed: {stderr}"
@@ -105,21 +105,21 @@ def test_config_unset():
         config_file = os.path.join(tmpdir, 'test.conf')
         
         # Set a value
-        run_command(['config', '--file', config_file, 'test.key', 'test-value'])
+        run_command(['--config', config_file, 'config', 'test.key', 'test-value'])
         
         # Verify it exists
-        returncode, stdout, stderr = run_command(['config', '--file', config_file, 'test.key'])
+        returncode, stdout, stderr = run_command(['--config', config_file, 'config', 'test.key'])
         assert stdout == 'test-value', "Value not set"
         print("✓ Value set")
         
         # Unset it
-        returncode, stdout, stderr = run_command(['config', '--file', config_file, '--unset', 'test.key'])
+        returncode, stdout, stderr = run_command(['--config', config_file, 'config', '--unset', 'test.key'])
         assert returncode == 0, f"Unset failed: {stderr}"
         assert 'Unset test.key' in stdout, f"Unexpected output: {stdout}"
         print("✓ config --unset works")
         
         # Verify it's gone
-        returncode, stdout, stderr = run_command(['config', '--file', config_file, 'test.key'])
+        returncode, stdout, stderr = run_command(['--config', config_file, 'config', 'test.key'])
         assert returncode == 1, "Key should not exist"
         print("✓ Key removed")
     
@@ -137,19 +137,19 @@ def test_config_validate():
         config_file = os.path.join(tmpdir, 'test.conf')
         
         # Create invalid config (S3 without bucket)
-        run_command(['config', '--file', config_file, 'backend.type', 's3'])
+        run_command(['--config', config_file, 'config', 'backend.type', 's3'])
         
         # Validate should fail
-        returncode, stdout, stderr = run_command(['config', '--file', config_file, '--validate'])
+        returncode, stdout, stderr = run_command(['--config', config_file, 'config', '--validate'])
         assert returncode == 1, "Validation should fail"
         assert 'backend.s3.bucket is required' in stdout, f"Wrong error: {stdout}"
         print("✓ Invalid config detected")
         
         # Add bucket
-        run_command(['config', '--file', config_file, 'backend.s3.bucket', 'test-bucket'])
+        run_command(['--config', config_file, 'config', 'backend.s3.bucket', 'test-bucket'])
         
         # Validate should pass
-        returncode, stdout, stderr = run_command(['config', '--file', config_file, '--validate'])
+        returncode, stdout, stderr = run_command(['--config', config_file, 'config', '--validate'])
         assert returncode == 0, f"Validation should pass: {stdout}"
         assert 'Configuration is valid' in stdout, f"Unexpected output: {stdout}"
         print("✓ Valid config accepted")
