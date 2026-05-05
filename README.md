@@ -1,11 +1,11 @@
-# yums3 - S3-Backed YUM Repository Manager
+# yums3 - S3-Backed YUM/DEB Repository Manager
 
-A lightweight Python tool for managing YUM/DNF repositories hosted on Amazon S3. Designed for efficient package publishing without requiring full repository downloads.
+A lightweight Python tool for managing YUM/DNF and DEB pkg repositories hosted on Amazon S3. Designed for efficient package publishing without requiring full repository downloads.
 
 ## Features
 
 - **Efficient Updates**: Add or remove packages without downloading existing RPMs
-- **Metadata Manipulation**: Direct XML manipulation for fast operations
+- **Metadata Manipulation**: Direct manipulation for fast operations
 - **SQLite Database Support**: Creates and maintains SQLite metadata for faster DNF/YUM queries
 - **S3 Native**: Built specifically for S3-backed repositories
 - **Auto-Detection**: Automatically detects architecture and EL version from RPMs
