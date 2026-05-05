@@ -51,9 +51,9 @@ def load_config(args, repo_type):
     return config
 
 
-def config_command(args):
+def config_command(args, repo_type='rpm'):
     """Handle config subcommand"""
-    config = load_config(args, 'yum')
+    config = load_config(args, repo_type)
     
     # Handle different operations
     if args.list:

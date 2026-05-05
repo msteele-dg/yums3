@@ -81,7 +81,7 @@ def main():
     
     # Handle config command
     if args.command == 'config':
-        return config_command(args)
+        return config_command(args, 'deb')
     
     # Load configuration
     try:

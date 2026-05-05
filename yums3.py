@@ -80,11 +80,11 @@ def main():
     
     # Handle config command
     if args.command == 'config':
-        return config_command(args)
+        return config_command(args, 'rpm')
     
     # Load configuration
     try:
-        config = load_config(args, 'yum')
+        config = load_config(args, 'rpm')
         print(config)
                
         # Initialize repository manager
