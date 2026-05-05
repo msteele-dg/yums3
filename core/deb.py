@@ -37,15 +37,8 @@ class DebRepo:
             config: RepoConfig instance with repository configuration
         """
         self.config = config
-        # Use Debian-specific config with fallback to shared config
         self.storage = create_storage_backend(config, repo_type='deb')
-        # Check repo.deb.cache_dir first, then repo.cache_dir, then default
-        cache_dir = (
-            config.get('repo.deb.cache_dir') or 
-            config.get('repo.cache_dir') or 
-            '~/deb-repo'
-        )
-        self.cache_dir = os.path.expanduser(cache_dir)
+        self.cache_dir = os.path.expanduser(config.get('repo.cache_dir', '~/deb-repo'))
         self.skip_validation = not config.get('validation.enabled', True)
         
         # Debian-specific configuration

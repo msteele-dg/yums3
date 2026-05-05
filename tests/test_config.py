@@ -26,36 +26,40 @@ def test_type_specific_config():
         json.dump({}, f)
     
     try:
-        config = RepoConfig(config_file)
-        
-        # Test with only shared config
+        # Test with only shared config (rpm context)
+        config = RepoConfig(config_file, 'rpm')
         config.set('backend.s3.bucket', 'shared-bucket')
-        assert config.get_for_type('backend.s3.bucket', 'rpm') == 'shared-bucket'
-        assert config.get_for_type('backend.s3.bucket', 'deb') == 'shared-bucket'
-        print("✓ Shared config works for both types")
-        
+        assert config.get('backend.s3.bucket') == 'shared-bucket'
+        print("✓ Shared config works for rpm")
+
+        # Test shared config in deb context
+        config_deb = RepoConfig(config_file, 'deb')
+        config_deb.set('backend.s3.bucket', 'shared-bucket')
+        assert config_deb.get('backend.s3.bucket') == 'shared-bucket'
+        print("✓ Shared config works for deb")
+
         # Test with type-specific override
         config.set('backend.rpm.s3.bucket', 'rpm-bucket')
-        assert config.get_for_type('backend.s3.bucket', 'rpm') == 'rpm-bucket'
-        assert config.get_for_type('backend.s3.bucket', 'deb') == 'shared-bucket'
+        assert config.get('backend.s3.bucket') == 'rpm-bucket'
+        assert config_deb.get('backend.s3.bucket') == 'shared-bucket'
         print("✓ Type-specific override works")
-        
+
         # Test with both type-specific configs
-        config.set('backend.deb.s3.bucket', 'deb-bucket')
-        assert config.get_for_type('backend.s3.bucket', 'rpm') == 'rpm-bucket'
-        assert config.get_for_type('backend.s3.bucket', 'deb') == 'deb-bucket'
+        config_deb.set('backend.deb.s3.bucket', 'deb-bucket')
+        assert config.get('backend.s3.bucket') == 'rpm-bucket'
+        assert config_deb.get('backend.s3.bucket') == 'deb-bucket'
         print("✓ Both type-specific configs work independently")
-        
+
         # Test with default value
-        assert config.get_for_type('backend.s3.profile', 'rpm', 'default-profile') == 'default-profile'
+        assert config.get('backend.s3.profile', 'default-profile') == 'default-profile'
         print("✓ Default value works when key not set")
-        
-        # Test cache_dir
+
+        # Test cache_dir with type-specific resolution
         config.set('repo.rpm.cache_dir', '/var/cache/yums3')
-        config.set('repo.deb.cache_dir', '/var/cache/debs3')
-        assert config.get('repo.rpm.cache_dir') == '/var/cache/yums3'
-        assert config.get('repo.deb.cache_dir') == '/var/cache/debs3'
-        print("✓ Type-specific cache directories work")
+        config_deb.set('repo.deb.cache_dir', '/var/cache/debs3')
+        assert config.get('repo.cache_dir') == '/var/cache/yums3'
+        assert config_deb.get('repo.cache_dir') == '/var/cache/debs3'
+        print("✓ Type-specific cache directories work via get()")
         
         return True
     

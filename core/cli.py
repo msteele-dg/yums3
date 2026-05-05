@@ -39,8 +39,8 @@ def config_command(args, repo_type):
     else:  # --global or default
         config_file = REPO_CONFIG_FILES.get("user")
     
-    config = RepoConfig(config_file)
-    
+    config = RepoConfig(config_file, repo_type)
+
     if args.list:
         print(f"Reading {config_file}")
         print("="*40)
@@ -164,7 +164,7 @@ def main(repo_type):
     
     # Load configuration
     try:
-        config = RepoConfig(args.config)
+        config = RepoConfig(args.config, repo_type)
         
         # Apply CLI argument overrides
         if args.bucket:

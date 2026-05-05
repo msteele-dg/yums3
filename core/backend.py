@@ -189,8 +189,8 @@ class S3StorageBackend(StorageBackend):
         if boto3 is None:
             raise ImportError("boto3 is required for S3StorageBackend. Install it with: pip install boto3")
 
-        bucket_name = config.get_for_type('backend.s3.bucket', repo_type)
-        endpoint = config.get_for_type('backend.s3.endpoint', repo_type)
+        bucket_name = config.get('backend.s3.bucket')
+        endpoint = config.get('backend.s3.endpoint')
 
         # Validate required configuration
         if not bucket_name:
@@ -199,8 +199,8 @@ class S3StorageBackend(StorageBackend):
         self.bucket_name = bucket_name
         self.endpoint_url = endpoint
 
-        aws_profile = config.get_for_type('backend.s3.profile', repo_type)
-        aws_region = config.get_for_type('backend.s3.region', repo_type)
+        aws_profile = config.get('backend.s3.profile')
+        aws_region = config.get('backend.s3.region')
         
         # Determine which profile/region to use:
         # 1. Explicit profile from config (if not 'default')
@@ -369,7 +369,7 @@ class LocalStorageBackend(StorageBackend):
             ValueError: If base_path is not provided or is empty
         """
         # Validate required configuration
-        base_path = config.get_for_type('backend.local.path', repo_type)
+        base_path = config.get('backend.local.path')
 
         if not base_path:
             raise ValueError("base_path is required for LocalStorageBackend")

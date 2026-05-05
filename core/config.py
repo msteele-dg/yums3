@@ -34,7 +34,21 @@ def load_config(args, repo_type):
             if os.path.exists(location.value):
                 config_file = location.value
 
-    return RepoConfig(config_file, repo_type)
+    config = RepoConfig(config_file, repo_type)
+
+    # Apply CLI argument overrides
+    if args.bucket:
+        config.set('backend.s3.bucket', args.bucket)
+    if args.cache_dir:
+        config.set('repo.cache_dir', args.cache_dir)
+    if args.s3_endpoint_url:
+        config.set('backend.s3.endpoint', args.s3_endpoint_url)
+    if args.profile:
+        config.set('backend.s3.profile', args.profile)
+    if hasattr(args, 'no_validate') and args.no_validate:
+        config.set('validation.enabled', False)
+
+    return config
 
 
 def config_command(args):
@@ -96,7 +110,7 @@ def config_command(args):
 
 class RepoConfig:
     """Git-style configuration manager with dot notation
-    
+
     Supports flat JSON structure with dot-notated keys for hierarchical organization.
     Example:
         {
@@ -105,15 +119,16 @@ class RepoConfig:
             "repo.cache_dir": "/var/cache/yums3"
         }
     """
-    
+
     # Default values
 
-        
-    def __init__(self, config_file: str, repo_type: str):
+
+    def __init__(self, config_file: str, repo_type: str = None):
         """Initialize configuration
-        
+
         Args:
             config_file: Path to config file (if None, searches standard locations)
+            repo_type: Repository type ('rpm' or 'deb') for type-specific fallback
         """
         self.repo_type = repo_type
         self.config_file = config_file
@@ -126,16 +141,35 @@ class RepoConfig:
                 self.track_defaults.append(k)
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Get a config value by dot-notated key
-        
+        """Get a config value with type-specific fallback
+
+        When repo_type is set, lookup order is:
+        1. Type-specific key (e.g., 'backend.rpm.s3.bucket')
+        2. Shared key (e.g., 'backend.s3.bucket')
+        3. Default value
+
+        When repo_type is not set, does direct key lookup only.
+
         Args:
             key: Dot-notated key (e.g., 'backend.s3.bucket')
             default: Default value if key not found
-        
+
         Returns:
             Config value or default
         """
-        # Check actual config first
+        if self.repo_type:
+            # Build type-specific key
+            parts = key.split('.')
+            if len(parts) >= 2:
+                type_specific_key = f"{parts[0]}.{self.repo_type}.{'.'.join(parts[1:])}"
+            else:
+                type_specific_key = f"{self.repo_type}.{key}"
+
+            # Try type-specific key first
+            if type_specific_key in self.data:
+                return self.data[type_specific_key]
+
+        # Fall back to shared key
         if key in self.data:
             return self.data[key]
 
@@ -193,48 +227,6 @@ class RepoConfig:
                 result[key] = value
                 
         return result
-    
-    def get_for_type(self, base_key: str, repo_type: str, default: Any = None) -> Any:
-        """Get a config value with type-specific fallback
-        
-        Lookup order:
-        1. Type-specific key (e.g., 'backend.rpm.s3.bucket')
-        2. Shared key (e.g., 'backend.s3.bucket')
-        3. Default value
-        
-        Args:
-            base_key: Base key without type (e.g., 'backend.s3.bucket')
-            repo_type: Repository type ('rpm' or 'deb')
-            default: Default value if key not found
-        
-        Returns:
-            Config value or default
-        
-        Example:
-            # For RPM repos, checks 'backend.rpm.s3.bucket' then 'backend.s3.bucket'
-            bucket = config.get_for_type('backend.s3.bucket', 'rpm')
-        """
-        # Parse the base key to insert type
-        parts = base_key.split('.')
-        if len(parts) >= 2:
-            # Insert type after first component: backend.s3.bucket -> backend.rpm.s3.bucket
-            type_specific_key = f"{parts[0]}.{repo_type}.{'.'.join(parts[1:])}"
-        else:
-            # Fallback for simple keys
-            type_specific_key = f"{repo_type}.{base_key}"
-        
-        # Try type-specific key first
-        value = self.get(type_specific_key)
-        if value is not None:
-            return value
-        
-        # Fall back to shared key
-        value = self.get(base_key)
-        if value is not None:
-            return value
-        
-        # Return default
-        return default
     
     def save(self, config_file: Optional[str] = None) -> None:
         """Save configuration to file

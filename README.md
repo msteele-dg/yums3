@@ -1,147 +1,178 @@
 # yums3 - S3-Backed YUM/DEB Repository Manager
 
-A lightweight Python tool for managing YUM/DNF and DEB pkg repositories hosted on Amazon S3. Designed for efficient package publishing without requiring full repository downloads.
+A lightweight Python tool for managing YUM/DNF and DEB package repositories hosted on Amazon S3 (or S3-compatible storage). Designed for efficient package publishing without requiring full repository downloads.
 
 ## Features
 
-- **Efficient Updates**: Add or remove packages without downloading existing RPMs
-- **Metadata Manipulation**: Direct manipulation for fast operations
+- **Efficient Updates**: Add or remove packages without downloading existing RPMs/DEBs
+- **Metadata Manipulation**: Direct XML manipulation for fast operations
 - **SQLite Database Support**: Creates and maintains SQLite metadata for faster DNF/YUM queries
-- **S3 Native**: Built specifically for S3-backed repositories
-- **Auto-Detection**: Automatically detects architecture and EL version from RPMs
+- **S3 Native**: Built for S3-backed repositories with pluggable local backend for testing
+- **Auto-Detection**: Automatically detects architecture and distro version from packages
 - **Validation**: Built-in repository integrity checks (XML + SQLite databases)
+- **Type-Specific Config**: Separate configuration per repo type (RPM vs DEB) with shared fallbacks
+- **Package Replication**: Replicate packages between distro versions (e.g., el9 to el10)
+- **Automatic Backups**: Metadata is backed up before changes and restored on failure
 
-## Requirements
+## Setup
+
+### Prerequisites
 
 - Python 3.6+
-- `boto3` - AWS SDK for Python
-- `createrepo_c` - YUM repository metadata creation tool
-- AWS credentials configured (via `~/.aws/credentials` or environment variables)
-- `rpm` command-line tool
+- AWS credentials configured (via `~/.aws/credentials`, environment variables, or IAM role)
 
 ### Installation
 
 ```bash
-# Install Python dependencies
-pip install boto3
-
-# Install system dependencies (Rocky/RHEL)
-dnf install createrepo_c rpm-build
-
-# Install system dependencies (Ubuntu/Debian)
-apt-get install createrepo-c rpm
+make setup-venv
+source ~/.venv/yums3/bin/activate
 ```
 
-## Quick Start
+This installs system dependencies (`createrepo_c`, `rpm`, etc.) using the appropriate package manager for your OS (brew on macOS, apt on Debian/Ubuntu, dnf on RHEL/Rocky), then creates a Python virtual environment and installs the Python dependencies (`boto3`, `lxml`).
+
+## Configuration
+
+Configuration uses a flat JSON format with dot-notated keys. Files are searched in order:
+
+1. `./dg-repos.conf` (local directory)
+2. `~/.dg-repos.conf` (user home)
+3. `/etc/dg-repos.conf` (system-wide)
+
+### Setting Config Values
+
+```bash
+./yums3.py config backend.type s3
+./yums3.py config backend.s3.bucket my-company-yum-repo
+./yums3.py config backend.s3.profile production
+./yums3.py config repo.cache_dir /tmp/yum-cache
+```
+
+### Listing Config
+
+```bash
+./yums3.py config --list
+```
+
+### Type-Specific Configuration
+
+Config keys support per-type overrides. For a key like `backend.s3.bucket`, the lookup order is:
+
+1. `backend.rpm.s3.bucket` (type-specific, when running yums3)
+2. `backend.s3.bucket` (shared fallback)
+3. Default value
+
+This lets RPM and DEB repos use different S3 buckets, AWS profiles, cache directories, etc. while sharing a single config file:
+
+```json
+{
+  "backend.type": "s3",
+  "backend.s3.bucket": "shared-bucket",
+  "backend.rpm.s3.bucket": "rpm-only-bucket",
+  "backend.deb.s3.bucket": "deb-only-bucket",
+  "backend.s3.profile": "production"
+}
+```
+
+### CLI Overrides
+
+Command-line arguments override config file values:
+
+```bash
+./yums3.py --bucket other-bucket add my-package.rpm
+./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
+./yums3.py --profile production add my-package.rpm
+./yums3.py --s3-endpoint-url https://s3.us-west-2.amazonaws.com add my-package.rpm
+```
+
+### Default Values
+
+| Key | Default |
+|---|---|
+| `backend.type` | `s3` |
+| `repo.rpm.cache_dir` | `~/yum-repo` |
+| `repo.deb.cache_dir` | `~/deb-repo` |
+| `validation.enabled` | `true` |
+| `behavior.confirm` | `true` |
+| `behavior.backup` | `true` |
+
+## Usage - YUM Repositories (yums3.py)
 
 ### Adding Packages
 
-Add one or more RPM packages to your repository:
-
 ```bash
+# Single package
 ./yums3.py add my-package-1.0.0-1.el9.x86_64.rpm
-```
 
-Add multiple packages at once:
-
-```bash
+# Multiple packages
 ./yums3.py add package1.rpm package2.rpm package3.rpm
-```
 
-Add packages using glob patterns:
-
-```bash
+# Glob patterns
 ./yums3.py add /tmp/rpmbuild/RPMS/x86_64/*.rpm
-```
 
-Skip confirmation prompt (useful for CI/CD):
-
-```bash
+# Skip confirmation (CI/CD)
 ./yums3.py add -y my-package.rpm
 ```
 
 ### Removing Packages
 
-Remove packages by filename:
-
 ```bash
 ./yums3.py remove my-package-1.0.0-1.el9.x86_64.rpm
+./yums3.py remove -y old-package1.rpm old-package2.rpm
 ```
 
-Remove multiple packages:
-
-```bash
-./yums3.py remove old-package1.rpm old-package2.rpm
-```
-
-Skip confirmation prompt:
-
-```bash
-./yums3.py remove -y old-package.rpm
-```
-
-### Validating Repository
-
-Perform full validation of a repository:
+### Validating a Repository
 
 ```bash
 ./yums3.py validate el9/x86_64
 ```
 
-This checks:
-- Metadata integrity (checksums, sizes, XML validity)
-- Repository consistency (all packages exist, no orphans)
-- Client compatibility (DNF requirements)
+### Replicating Packages Between Distros
 
-Skip post-operation validation (for speed):
+```bash
+./yums3.py replicate --src el9 --dst el10 libtorch myapp
+./yums3.py replicate --src el9 --dst el10 --arch aarch64 -y myapp
+```
+
+### Skip Post-Operation Validation
 
 ```bash
 ./yums3.py add --no-validate my-package.rpm
 ./yums3.py remove --no-validate old-package.rpm
 ```
 
-**Note**: Quick validation runs automatically after add/remove operations unless `--no-validate` is specified.
+## Usage - DEB Repositories (debs3.py)
 
-### Configuration Management
-
-Get configuration values:
+### Adding Packages
 
 ```bash
-./yums3.py config backend.type
+./debs3.py add my-package_1.0.0_amd64.deb
+./debs3.py add -y package1.deb package2.deb
+./debs3.py add --distribution noble --component main my-package.deb
 ```
 
-Set configuration values:
+### Removing Packages
 
 ```bash
-./yums3.py config backend.s3.bucket my-bucket
+./debs3.py remove my-package
+./debs3.py remove --distribution focal --component main --architecture amd64 my-package
 ```
 
-List all configuration:
+### Validating a Repository
 
 ```bash
-./yums3.py config --list
+./debs3.py validate focal main amd64
 ```
 
-### Global Options
-
-Override configuration with command-line options:
+### Replicating Packages Between Distributions
 
 ```bash
-# Use different bucket
-./yums3.py --bucket other-bucket add my-package.rpm
-
-# Use different cache directory
-./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
-
-# Use different AWS profile
-./yums3.py --profile production add my-package.rpm
+./debs3.py replicate --src focal --dst noble my-package
+./debs3.py replicate --src focal --dst noble --component main --arch amd64 -y my-package
 ```
 
 ## How It Works
 
-### Repository Structure
-
-The tool organizes packages in S3 by EL version and architecture:
+### YUM Repository Structure (S3)
 
 ```
 s3://your-bucket/
@@ -152,564 +183,120 @@ s3://your-bucket/
 │   │   └── repodata/
 │   │       ├── repomd.xml
 │   │       ├── <checksum>-primary.xml.gz
+│   │       ├── <checksum>-primary_db.sqlite.bz2
 │   │       ├── <checksum>-filelists.xml.gz
-│   │       └── <checksum>-other.xml.gz
+│   │       ├── <checksum>-filelists_db.sqlite.bz2
+│   │       ├── <checksum>-other.xml.gz
+│   │       └── <checksum>-other_db.sqlite.bz2
 │   └── aarch64/
 │       └── ...
 └── el8/
     └── ...
 ```
 
+### DEB Repository Structure (S3)
+
+```
+s3://your-bucket/
+├── dists/
+│   └── focal/
+│       ├── Release
+│       └── main/
+│           └── binary-amd64/
+│               ├── Packages
+│               ├── Packages.gz
+│               └── Packages.bz2
+└── pool/
+    └── main/
+        └── m/
+            └── myapp/
+                └── myapp_1.0.0_amd64.deb
+```
+
+### Metadata Operations
+
+Instead of downloading all packages to regenerate metadata, the tool directly manipulates metadata XML/control files:
+
+**Adding**: Downloads metadata only, generates metadata for new packages in a temp dir, merges XML trees, recalculates checksums, creates SQLite databases, and uploads.
+
+**Removing**: Downloads metadata only, parses XML, removes package entries, updates checksums and SQLite databases, uploads modified metadata, deletes packages from S3.
+
 ### Automatic Backups
 
-Before making any changes, the tool automatically creates a timestamped backup of the metadata in S3:
+Before any metadata changes, a timestamped backup is created in S3. On success the backup is cleaned up. On failure, metadata is automatically restored from the backup.
 
-```
-s3://your-bucket/el9/x86_64/repodata.backup-20250121-143022/
-```
+### Deduplication
 
-**On success**: Backup is automatically cleaned up
-**On failure**: Metadata is automatically restored from backup, and backup is retained for inspection
-
-This ensures you can always recover from failed operations without manual intervention.
-
-### Metadata Manipulation
-
-Instead of downloading all RPMs to regenerate metadata, this tool directly manipulates the YUM metadata XML files:
-
-#### Adding Packages
-
-1. **Download metadata only** - Fetches `repodata/` directory from S3
-2. **Generate new metadata** - Creates metadata for new packages in a temporary location
-3. **Merge XML** - Parses both metadata sets and merges package entries
-4. **Update checksums** - Recalculates checksums and renames files accordingly
-5. **Upload** - Uploads new packages and updated metadata to S3
-
-#### Removing Packages
-
-1. **Download metadata only** - Fetches `repodata/` directory from S3
-2. **Parse XML** - Reads primary, filelists, and other metadata files
-3. **Remove entries** - Deletes package entries from XML trees
-4. **Update checksums** - Recalculates checksums for modified files
-5. **Upload** - Uploads updated metadata and deletes RPMs from S3
-
-### Namespace Handling
-
-YUM metadata uses XML namespaces, but different tools have different expectations:
-
-- `createrepo_c` generates metadata **with** namespace prefixes (`<repo:data>`)
-- `dnf`/`yum` clients expect `repomd.xml` **without** namespace prefixes (`<data>`)
-- Other metadata files (primary.xml.gz, etc.) can have namespaces
-
-This tool handles this by:
-- Preserving namespaces in primary/filelists/other metadata
-- Stripping namespace prefixes from `repomd.xml` for DNF compatibility
-- Supporting both formats when reading metadata
-
-## Configuration
-
-### Configuration File
-
-Create a configuration file to avoid specifying options every time:
-
-**Location** (searched in order):
-1. `./yums3.conf` (current directory)
-2. `~/.yums3.conf` (user home)
-3. `/etc/yums3.conf` (system-wide)
-
-**Format** (JSON):
-```json
-{
-  "s3_bucket": "your-bucket-name",
-  "local_repo_base": "/custom/cache/path"
-}
-```
-
-**Example:**
-```bash
-# Create user config using config command
-./yums3.py config backend.type s3
-./yums3.py config backend.s3.bucket my-company-yum-repo
-./yums3.py config repo.cache_dir /tmp/yum-cache
-
-# Or create manually
-cat > ~/.yums3.conf <<EOF
-{
-  "backend.type": "s3",
-  "backend.s3.bucket": "my-company-yum-repo",
-  "repo.cache_dir": "/tmp/yum-cache"
-}
-EOF
-
-# Now you can run without specifying bucket
-./yums3.py add my-package.rpm
-```
-
-### Command-Line Overrides
-
-CLI arguments override config file values:
-
-```bash
-# Use different bucket (overrides config)
-./yums3.py --bucket other-bucket add my-package.rpm
-
-# Use different cache directory (overrides config)
-./yums3.py --cache-dir /tmp/custom-cache add my-package.rpm
-
-# Use different AWS profile (overrides config)
-./yums3.py --profile production add my-package.rpm
-```
-
-### S3 Bucket
-
-If no configuration file exists and no `--bucket` argument is provided, the default bucket `deepgram-yum-repo` is used.
-
-### AWS Credentials
-
-The tool uses standard AWS credential resolution:
-
-1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-2. AWS credentials file (`~/.aws/credentials`)
-3. IAM role (when running on EC2)
-
-Required S3 permissions:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::your-bucket-name/*",
-        "arn:aws:s3:::your-bucket-name"
-      ]
-    }
-  ]
-}
-```
+When adding packages, the tool checks checksums against existing packages. Exact duplicates are skipped, same-name packages with different checksums are updated.
 
 ## Client Configuration
 
-### Public S3 Bucket (Recommended for Open Source)
-
-If your S3 bucket allows public read access:
+### Public S3 Bucket
 
 ```bash
-# Create repo configuration (works for all EL versions and architectures)
 sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
 [my-repo]
 name=My Repository
 baseurl=https://your-bucket.s3.amazonaws.com/el\$releasever/\$basearch
 enabled=1
 gpgcheck=0
-repo_gpgcheck=0
 EOF
 
-# Update cache and install packages
 sudo dnf makecache
-sudo dnf install my-package
-```
-
-**YUM Variables Explained:**
-- `$releasever` - Automatically expands to `9` on Rocky/RHEL 9, `8` on Rocky/RHEL 8, etc.
-- `$basearch` - Automatically expands to `x86_64`, `aarch64`, etc.
-- Use `\$` to prevent shell expansion when writing the config file
-
-**Result:** On Rocky Linux 9 x86_64, the baseurl becomes:
-```
-https://your-bucket.s3.amazonaws.com/el9/x86_64
 ```
 
 ### Private S3 Bucket (IAM Roles)
 
-For private buckets, use IAM roles on EC2 instances:
-
-**1. Create IAM policy:**
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::your-bucket/*",
-        "arn:aws:s3:::your-bucket"
-      ]
-    }
-  ]
-}
-```
-
-**2. Attach policy to EC2 instance role**
-
-**3. Install S3 plugin for YUM:**
 ```bash
-# Rocky/RHEL 9
 sudo dnf install python3-dnf-plugin-s3
 
-# Rocky/RHEL 8
-sudo dnf install python3-dnf-plugin-s3
-
-# Ubuntu (requires custom setup)
-# S3 plugin not officially supported, use presigned URLs instead
-```
-
-**4. Configure repo:**
-```bash
 sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
 [my-repo]
 name=My Private Repository
 baseurl=s3://your-bucket/el\$releasever/\$basearch
 enabled=1
 gpgcheck=0
-repo_gpgcheck=0
 s3_enabled=1
 EOF
 ```
 
-### Private S3 Bucket (Presigned URLs)
-
-For temporary access without IAM roles:
-
-**1. Generate presigned URL (valid for 7 days):**
-```bash
-aws s3 presign s3://your-bucket/el9/x86_64/repodata/repomd.xml --expires-in 604800
-```
-
-**2. Use CloudFront or API Gateway** for permanent URLs with authentication
-
-**3. Or use a simple proxy script:**
-```bash
-# Install nginx
-sudo dnf install nginx
-
-# Configure nginx to proxy S3 with credentials
-sudo tee /etc/nginx/conf.d/yum-proxy.conf <<EOF
-server {
-    listen 8080;
-    location / {
-        proxy_pass https://your-bucket.s3.amazonaws.com;
-        proxy_set_header Authorization "AWS4-HMAC-SHA256 ...";
-    }
-}
-EOF
-
-# Configure repo to use local proxy
-sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
-[my-repo]
-name=My Repository
-baseurl=http://localhost:8080/el\$releasever/\$basearch
-enabled=1
-gpgcheck=0
-repo_gpgcheck=0
-EOF
-```
-
-### With GPG Package Signing
-
-If you signed your RPMs:
-
-```bash
-# Import GPG public key
-sudo rpm --import https://your-bucket.s3.amazonaws.com/RPM-GPG-KEY-your-repo
-
-# Configure repo with GPG check enabled
-sudo tee /etc/yum.repos.d/my-repo.repo <<EOF
-[my-repo]
-name=My Repository
-baseurl=https://your-bucket.s3.amazonaws.com/el\$releasever/\$basearch
-enabled=1
-gpgcheck=1
-repo_gpgcheck=0
-gpgkey=https://your-bucket.s3.amazonaws.com/RPM-GPG-KEY-your-repo
-EOF
-```
-
-### Testing Your Configuration
-
-```bash
-# Clear cache
-sudo dnf clean all
-
-# Verify repo is accessible
-sudo dnf repolist
-
-# List available packages
-sudo dnf list available --repo=my-repo
-
-# Install a package
-sudo dnf install --repo=my-repo my-package
-```
-
-### Troubleshooting Client Issues
-
-**"Cannot retrieve repository metadata"**
-```bash
-# Check what variables expand to on your system
-echo "Release: $(rpm -E %{rhel}), Arch: $(uname -m)"
-
-# Check S3 bucket permissions (adjust el9/x86_64 to match your system)
-aws s3 ls s3://your-bucket/el9/x86_64/repodata/
-
-# Test direct access
-curl -I https://your-bucket.s3.amazonaws.com/el9/x86_64/repodata/repomd.xml
-
-# Check repo configuration and variable expansion
-sudo dnf repolist -v
-```
-
-**"Checksum doesn't match"**
-```bash
-# Clear DNF cache
-sudo dnf clean all
-sudo dnf makecache
-```
-
-**"404 Not Found"**
-- Verify the EL version and architecture match your system
-- Check that packages were uploaded successfully
-- Ensure S3 bucket allows public read (or IAM role is configured)
-
-## Caveats and Limitations
-
-### Concurrency
-
-**⚠️ This tool is NOT safe for concurrent operations.**
-
-- Multiple simultaneous updates can corrupt metadata
-- No locking mechanism is implemented
-- Use external coordination (e.g., CI/CD pipeline serialization) if needed
-
-**Recommendation**: Run operations sequentially, especially in CI/CD pipelines.
-
-**Note**: While backups protect against operation failures, they don't prevent corruption from concurrent modifications.
-
-### Client Behavior During Updates
-
-When metadata is being updated:
-
-- **Clients mid-download**: May see inconsistent state if they cached old `repomd.xml` but fetch new metadata files
-- **Checksum mismatches**: Clients will fail with checksum errors if they fetch metadata during an update
-- **Retry behavior**: Most clients will retry and succeed once the update completes
-
-**Best practices**:
-- Perform updates during low-traffic periods
-- Consider using a staging repository for testing
-- Monitor for failed client requests after updates
-
-### Metadata Consistency
-
-The tool updates metadata in this order:
-1. Upload new RPM files
-2. Delete old metadata files
-3. Upload new metadata files
-
-There's a brief window where:
-- Old metadata may reference non-existent files (if clients cached `repomd.xml`)
-- New files exist but aren't in metadata yet
-
-This is generally acceptable for most use cases, but be aware of the window.
-
-### Large Repositories
-
-For repositories with many packages:
-- Metadata files can become large (100s of MB)
-- XML parsing and manipulation takes time
-- Consider splitting into multiple repositories by purpose/version
-
-### No Repository Signature Support
-
-This tool does not sign repository metadata (`repomd.xml`). This is intentional - repository signing adds complexity and is often unnecessary for internal/private repositories.
-
-**If you need signed packages:**
-- Sign individual RPMs before adding them to the repository (recommended)
-- RPM signatures are preserved and verified by clients independently of repository signatures
-- Use `rpm --addsign` or `rpmsign` to sign RPMs at build time
-
-**Repository vs Package Signing:**
-- **Package signing** (recommended): Verifies the RPM itself hasn't been tampered with
-- **Repository signing** (optional): Verifies the repository metadata hasn't been tampered with
-- For most use cases, package signing alone is sufficient
-
-**To use signed RPMs:**
-```bash
-# Sign RPM at build time
-rpmsign --addsign --key-id=YOUR_KEY_ID package.rpm
-
-# Add to repository (signature is preserved)
-./yums3.py package.rpm
-
-# Clients verify RPM signatures automatically
-dnf install package  # Verifies RPM signature
-```
-
-## Troubleshooting
-
-### "Package 'X' not found in repository"
-
-The package doesn't exist in S3. List packages to verify:
-
-```bash
-aws s3 ls s3://your-bucket/el9/x86_64/ | grep '\.rpm$'
-```
-
-### Operation failed and metadata was corrupted
-
-The tool automatically restores from backup on failure. If manual restoration is needed:
-
-```bash
-# List available backups
-aws s3 ls s3://your-bucket/el9/x86_64/ | grep backup
-
-# Manually restore from a specific backup
-aws s3 sync s3://your-bucket/el9/x86_64/repodata.backup-20250121-143022/ \
-             s3://your-bucket/el9/x86_64/repodata/
-```
-
-### Validation failures
-
-Run full validation to diagnose issues:
-
-```bash
-./yums3.py --validate el9/x86_64
-```
-
-Common issues:
-- **Checksum mismatches**: Metadata was corrupted, restore from backup
-- **Missing RPMs**: Referenced in metadata but not in S3, remove and re-add
-- **Orphaned RPMs**: In S3 but not in metadata, remove manually or re-add to repo
-- **Namespace prefixes**: Run the tool again to fix (it strips namespaces automatically)
-
-### "Checksum doesn't match" errors on clients
-
-Metadata was updated while client was downloading. Client should retry automatically. If persistent:
-
-```bash
-# Clear client cache
-dnf clean all
-dnf makecache
-```
-
-### "Unknown element" warnings from createrepo_c
-
-These are usually harmless warnings about XML namespaces. The tool handles them correctly.
-
-### AWS credentials errors
-
-Ensure your AWS credentials are configured:
-
-```bash
-aws configure
-# or
-export AWS_ACCESS_KEY_ID=your-key
-export AWS_SECRET_ACCESS_KEY=your-secret
-export AWS_DEFAULT_REGION=us-east-1
-```
-
-## Contributing
-
-This tool is designed for specific use cases. If you need additional features:
-
-- **GPG signing**: Consider using `createrepo_c` directly with signing options
-- **Concurrent updates**: Implement external locking (e.g., DynamoDB, Redis)
-- **Delta RPMs**: Use `createrepo_c` with `--deltas` option
-- **Multiple architectures**: Run the tool separately for each architecture
-
-## License
-
-This tool is provided as-is for managing YUM repositories on S3. Modify as needed for your use case.
+## Caveats
+
+- **Not concurrent-safe**: Multiple simultaneous updates can corrupt metadata. Use external locking (e.g., CI/CD pipeline serialization).
+- **Brief inconsistency window**: During metadata updates, clients may see transient checksum mismatches. They will retry and succeed once the update completes.
+- **No repository signing**: Individual RPM signing is supported and recommended; repository metadata signing (`repomd.xml`) is not implemented.
 
 ## Project Structure
 
 ```
 yums3/
-├── core/                    # Core modules
-│   ├── __init__.py
-│   ├── backend.py          # Storage backend abstraction
-│   ├── config.py           # Configuration management
-│   └── sqlite_metadata.py  # SQLite database generation
-├── tests/                   # Test suite
-│   ├── test_config.py
-│   ├── test_config_command.py
-│   ├── test_storage_backend.py
-│   ├── test_sqlite_integration.py
-│   └── ...
-├── docs/                    # Documentation
-│   ├── CONFIG_COMMAND_REFERENCE.md
-│   ├── REPOCONFIG_COMPLETE.md
-│   ├── STORAGE_BACKEND_INTEGRATION.md
-│   └── ...
-├── test_rpms/              # Test RPM packages
-├── yums3.py                # Main script
-└── README.md               # This file
+├── core/
+│   ├── __init__.py          # Exports and Colors utility
+│   ├── backend.py           # Storage backend abstraction (S3 + local)
+│   ├── cli.py               # Generic CLI interface
+│   ├── config.py            # Configuration management (RepoConfig)
+│   ├── constants.py         # Defaults, config file locations
+│   ├── deb.py               # Debian repository manager
+│   ├── sqlite_metadata.py   # SQLite database generation
+│   └── yum.py               # YUM repository manager
+├── scripts/                  # Utility scripts
+├── tests/                    # Test suite
+├── yums3.py                  # YUM CLI entry point
+├── debs3.py                  # DEB CLI entry point
+├── Makefile                  # setup-venv target
+├── requirements.txt          # Python dependencies (boto3, lxml)
+└── README.md
 ```
 
 ## Testing
 
-Run the test suite to verify functionality:
-
 ```bash
-# Test configuration management
+source ~/.venv/yums3/bin/activate
 python3 tests/test_config.py
-python3 tests/test_config_command.py
-
-# Test storage backends
 python3 tests/test_storage_backend.py
-
-# Test SQLite integration
 python3 tests/test_sqlite_integration.py
-
-# Test DNF compatibility (requires dnf)
-python3 tests/test_dnf_compatibility.py
 ```
 
-## SQLite Database Support
+## License
 
-yums3 automatically creates and maintains SQLite databases alongside XML metadata. This provides:
-
-- **Faster queries**: DNF/YUM can use indexed database queries instead of parsing XML
-- **Lower memory usage**: Clients don't need to load entire XML files into memory
-- **Better performance**: Especially noticeable with large repositories (1000+ packages)
-
-### What Gets Created
-
-For each repository, yums3 creates:
-
-- `*-primary.xml.gz` + `*-primary_db.sqlite.bz2`
-- `*-filelists.xml.gz` + `*-filelists_db.sqlite.bz2`
-- `*-other.xml.gz` + `*-other_db.sqlite.bz2`
-
-Both XML and SQLite are kept in sync automatically.
-
-## Documentation
-
-### Quick Links
-
-- **[User Guide](docs/USER_GUIDE.md)** - Complete user documentation
-- **[Configuration Reference](docs/CONFIG_COMMAND_REFERENCE.md)** - Config command guide
-- **[Architecture](docs/ARCHITECTURE.md)** - System design and architecture
-- **[Developer Guide](docs/DEVELOPER_GUIDE.md)** - For contributors
-- **[Documentation Index](docs/INDEX.md)** - Complete documentation index
-
-### Getting Started
-
-1. **New users:** Start with the [User Guide](docs/USER_GUIDE.md)
-2. **Configuration:** See [Configuration Reference](docs/CONFIG_COMMAND_REFERENCE.md)
-3. **Developers:** Read the [Developer Guide](docs/DEVELOPER_GUIDE.md)
-4. **Architecture:** Understand the [Architecture](docs/ARCHITECTURE.md)
-
-## See Also
-
-- [createrepo_c documentation](https://github.com/rpm-software-management/createrepo_c)
-- [YUM repository format](https://docs.fedoraproject.org/en-US/quick-docs/repositories/)
-- [DNF documentation](https://dnf.readthedocs.io/)
+MIT License. See [LICENSE](LICENSE) for details.

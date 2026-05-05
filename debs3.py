@@ -87,18 +87,6 @@ def main():
     try:
         config = load_config(args, 'deb')
         
-        # Apply CLI argument overrides
-        if args.bucket:
-            config.set('backend.s3.bucket', args.bucket)
-        if args.cache_dir:
-            config.set('repo.cache_dir', args.cache_dir)
-        if args.s3_endpoint_url:
-            config.set('backend.s3.endpoint', args.s3_endpoint_url)
-        if args.profile:
-            config.set('backend.s3.profile', args.profile)
-        if hasattr(args, 'no_validate') and args.no_validate:
-            config.set('validation.enabled', False)
-        
         # Initialize repository manager
         repo = DebRepo(config)
 
