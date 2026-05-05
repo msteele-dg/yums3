@@ -1,4 +1,5 @@
 VENV_DIR ?= ~/.venv/yums3
+SUDO := $(shell [ "$$(id -u)" = 0 ] || echo sudo)
 
 .PHONY: setup-venv
 
@@ -9,10 +10,10 @@ setup-venv:
 		brew install createrepo_c rpm lxml || true; \
 	elif [ -f /etc/debian_version ]; then \
 		echo "  Detected Debian/Ubuntu"; \
-		sudo apt-get update && sudo apt-get install -y createrepo-c rpm python3-lxml; \
+		$(SUDO) apt-get update && $(SUDO) apt-get install -y createrepo-c rpm python3-lxml; \
 	elif [ -f /etc/redhat-release ]; then \
 		echo "  Detected RHEL/Rocky"; \
-		sudo dnf install -y createrepo_c rpm-build python3-lxml; \
+		$(SUDO) dnf install -y createrepo_c rpm-build python3-lxml; \
 	else \
 		echo "  Unknown OS — install createrepo_c and rpm manually"; \
 	fi
